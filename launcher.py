@@ -184,6 +184,11 @@ def _maybe_prompt_cookie_unlock(app: QApplication, parent=None) -> None:
 
 
 def main():
+    if len(sys.argv) >= 2 and sys.argv[1] == "--merchant-fix-helper":
+        from merchant_fix import run_helper_from_argv
+
+        raise SystemExit(run_helper_from_argv(sys.argv[1:]))
+
     # Silence noisy Windows DPI-awareness warning:
     # "qt.qpa.window: SetProcessDpiAwarenessContext() failed: Access is denied."
     try:

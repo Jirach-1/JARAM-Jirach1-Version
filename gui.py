@@ -31,12 +31,14 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QAbstractItemView, QHeaderView, QScrollArea, QRubberBand,
                             QRadioButton, QListWidget, QListWidgetItem, QKeySequenceEdit,
                             QStyledItemDelegate, QStyleOptionViewItem, QMenu,
-                            QToolButton)
+                            QToolButton, QTableView)
 from PySide6.QtCore import (
     QTimer,
     QThread,
     QRunnable,
     QThreadPool,
+    QAbstractTableModel,
+    QModelIndex,
     Signal,
     QEvent,
     Qt,
@@ -500,6 +502,18 @@ from roblox_log_cleanup import (
     inactive_seconds as roblox_log_cleanup_inactive_seconds,
     normalize_cleanup_config as normalize_roblox_log_cleanup_config,
 )
+from merchant_fix import (
+    SMART_BLOCK_TRIGGER_BOSS_RAID_UI,
+    SMART_BLOCK_TRIGGER_MENU_EXIT,
+    SMART_USER_SCOPE_BLACKLIST,
+    SMART_USER_SCOPE_WHITELIST,
+    clear_roblox_storage,
+    close_roblox_processes,
+    get_merchant_fix_controller,
+    get_merchant_fix_log_path,
+    get_roblox_storage_dir,
+    is_classic_block_active,
+)
 from discord_account_control import DiscordBotService, format_discord_ids, normalize_discord_ids
 from found_stats import FoundStatsMixin
 from launch_priority import (
@@ -628,6 +642,8 @@ _ANTIAFK_AUTO_ACTION_OVERDUE_MIN_DEFAULT = 10.0
 _AUTO_ACTION_ANTIAFK_PAUSE_GUARD_S = 30.0
 _ACTIVITY_TIMESTAMP_ROLE = int(Qt.ItemDataRole.UserRole) + 50
 _LAUNCH_PRIORITY_STATUS_ROLE = int(Qt.ItemDataRole.UserRole) + 51
+_TABLE_ACTIONS_ROLE = int(Qt.ItemDataRole.UserRole) + 52
+_TABLE_ACTION_UID_ROLE = int(Qt.ItemDataRole.UserRole) + 53
 
 
 def _coerce_activity_timestamp(value: object) -> float:
@@ -983,6 +999,7 @@ class ConfigManager:
                 "workers": 1,
                 "max_captures_per_second": 20,
                 "batch_delay_seconds": 1.0,
+                "processing_mode": "separate",
                 "use_preprocess": True,
                 "frame_diff_tolerance": 2,    # percent (skip OCR if frame changes <= this)
                 "log_ocr_text": False,        # debug: include OCR text in OCR log
@@ -1084,6 +1101,14 @@ class ConfigManager:
 
             "roblox_log_cleanup": dict(ROBLOX_LOG_CLEANUP_DEFAULT_CONFIG),
 
+            "merchant_fix": {
+                "smart_enabled": False,
+                "smart_block_trigger": SMART_BLOCK_TRIGGER_BOSS_RAID_UI,
+                "post_marker_delay_seconds": 0.0,
+                "smart_user_scope": SMART_USER_SCOPE_BLACKLIST,
+                "smart_user_ids": [],
+            },
+
         }
 
 
@@ -1108,6 +1133,11 @@ class ConfigManager:
         self._users_cache_mtime: float = -1.0
         self._users_cache: dict = {}
         self._users_cache_unlock_token: int = -1
+        self._users_cache_generation: int = 0
+        self._users_runtime_signature_generation: int = -1
+        self._users_runtime_signature: bytes = b""
+        self._users_catalog_signature_generation: int = -1
+        self._users_catalog_signature: tuple = ()
         self._raw_cookie_cache: dict = {}
         self._settings_cache_mtime: float = -1.0
         self._settings_cache: dict = {}
@@ -2138,6 +2168,7 @@ class ConfigManager:
                 self._users_cache = self._apply_cookie_encryption_on_load(copy.deepcopy(encrypted))
                 self._users_cache_mtime = self._file_mtime(self.users_file)
                 self._users_cache_unlock_token = self._get_cookie_unlock_token()
+                self._invalidate_users_signatures_locked()
         except Exception:
             pass
         return True
@@ -2189,6 +2220,7 @@ class ConfigManager:
                 self._users_cache = dict(decrypted or {})
                 self._users_cache_mtime = self._file_mtime(self.users_file)
                 self._users_cache_unlock_token = self._get_cookie_unlock_token()
+                self._invalidate_users_signatures_locked()
         except Exception:
             pass
         return True
@@ -2251,6 +2283,7 @@ class ConfigManager:
                 self._users_cache = dict(cleaned or {})
                 self._users_cache_mtime = self._file_mtime(self.users_file)
                 self._users_cache_unlock_token = self._get_cookie_unlock_token()
+                self._invalidate_users_signatures_locked()
         except Exception:
             pass
         return True
@@ -2328,6 +2361,7 @@ class ConfigManager:
                 self._users_cache = self._apply_cookie_encryption_on_load(copy.deepcopy(encrypted))
                 self._users_cache_mtime = self._file_mtime(self.users_file)
                 self._users_cache_unlock_token = self._get_cookie_unlock_token()
+                self._invalidate_users_signatures_locked()
         except Exception:
             pass
         return True
@@ -2346,6 +2380,67 @@ class ConfigManager:
 
     def get_users_mtime(self) -> float:
         return self._file_mtime(self.users_file)
+
+    def _invalidate_users_signatures_locked(self) -> None:
+        """Invalidate derived indexes after a meaningful users cache replacement."""
+        self._users_cache_generation += 1
+
+    def get_users_runtime_signature(self) -> bytes:
+        """Return a stable signature for manager-relevant account settings.
+
+        ``last_launch`` is intentionally excluded. It is operational history, not
+        manager configuration, and can change once per launch without requiring a
+        500-account hot reload.
+        """
+        self.peek_users()
+        with self._cache_lock:
+            generation = self._users_cache_generation
+            if self._users_runtime_signature_generation == generation:
+                return self._users_runtime_signature
+            digest = hashlib.sha256()
+            users = self._users_cache if isinstance(self._users_cache, dict) else {}
+            for uid in sorted(users, key=lambda value: str(value)):
+                info = users.get(uid)
+                if isinstance(info, dict):
+                    relevant = {key: value for key, value in info.items() if key != "last_launch"}
+                else:
+                    relevant = info
+                digest.update(str(uid).encode("utf-8", "surrogatepass"))
+                digest.update(b"\0")
+                digest.update(
+                    json.dumps(
+                        relevant,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                        default=str,
+                    ).encode("utf-8", "surrogatepass")
+                )
+                digest.update(b"\0")
+            self._users_runtime_signature = digest.digest()
+            self._users_runtime_signature_generation = generation
+            return self._users_runtime_signature
+
+    def get_users_catalog_signature(self) -> tuple:
+        """Return the lightweight identity/name signature used by account pickers."""
+        self.peek_users()
+        with self._cache_lock:
+            generation = self._users_cache_generation
+            if self._users_catalog_signature_generation == generation:
+                return self._users_catalog_signature
+            users = self._users_cache if isinstance(self._users_cache, dict) else {}
+            signature = tuple(
+                sorted(
+                    (
+                        str(uid),
+                        str(info.get("username") or "") if isinstance(info, dict) else "",
+                    )
+                    for uid, info in users.items()
+                )
+            )
+            self._users_catalog_signature = signature
+            self._users_catalog_signature_generation = generation
+            return signature
 
     def get_settings_mtime(self) -> float:
         return self._file_mtime(self.settings_file)
@@ -2394,6 +2489,7 @@ class ConfigManager:
                 self._users_cache_mtime = mtime2
                 self._users_cache = data if isinstance(data, dict) else {}
                 self._users_cache_unlock_token = unlock_token
+                self._invalidate_users_signatures_locked()
             return self._users_cache
         except Exception:
             return {}
@@ -2447,6 +2543,7 @@ class ConfigManager:
                     self._users_cache = self._apply_cookie_encryption_on_load(copy.deepcopy(formatted_data))
                     self._users_cache_mtime = self._file_mtime(self.users_file)
                     self._users_cache_unlock_token = self._get_cookie_unlock_token()
+                    self._invalidate_users_signatures_locked()
             except Exception:
                 pass
             return True
@@ -2483,8 +2580,17 @@ class ConfigManager:
 
                 try:
                     with self._cache_lock:
-                        self._update_raw_cookie_cache(users_data)
-                        self._users_cache = self._apply_cookie_encryption_on_load(copy.deepcopy(users_data))
+                        raw_cookie = info.get("cookie")
+                        if raw_cookie is not None:
+                            self._raw_cookie_cache[uid] = str(raw_cookie)
+                        cached_info = self._users_cache.get(uid) if isinstance(self._users_cache, dict) else None
+                        if isinstance(cached_info, dict):
+                            # This is the only field changed by this write. Preserve
+                            # decrypted cookies and all cached signatures/indexes.
+                            cached_info["last_launch"] = ts
+                        else:
+                            self._users_cache = self._apply_cookie_encryption_on_load(copy.deepcopy(users_data))
+                            self._invalidate_users_signatures_locked()
                         self._users_cache_mtime = self._file_mtime(self.users_file)
                         self._users_cache_unlock_token = self._get_cookie_unlock_token()
                 except Exception:
@@ -2610,6 +2716,18 @@ class ConfigManager:
     def save_settings(self, settings_data):
         try:
             self._set_cookie_error("")
+
+            # Most feature tabs use debounced saves.  Several live-apply paths
+            # can legitimately request a save even when their values did not
+            # change (for example while widgets are initialized).  Avoid a full
+            # backup, JSON serialization and fsync for those no-op requests.
+            try:
+                current = self.peek_settings()
+                if isinstance(settings_data, dict) and settings_data == current:
+                    return True
+            except Exception:
+                pass
+
             prepared = self._prepare_settings_for_save(settings_data)
             if prepared is None:
                 return False
@@ -3347,6 +3465,52 @@ class _LaunchPriorityStatusDelegate(QStyledItemDelegate):
             painter.restore()
 
 
+class _LaunchPriorityDelegate(QStyledItemDelegate):
+    """Create a spin box only for the priority cell currently being edited."""
+
+    def createEditor(self, parent, option, index):
+        editor = _AutoItemSpinBox(parent)
+        editor.setRange(MIN_LAUNCH_PRIORITY, MAX_LAUNCH_PRIORITY)
+        editor.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        editor.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.UpDownArrows)
+        return editor
+
+    def setEditorData(self, editor, index):
+        editor.setValue(coerce_launch_priority(index.data(Qt.ItemDataRole.EditRole)))
+
+    def setModelData(self, editor, model, index):
+        model.setData(index, coerce_launch_priority(editor.value()), Qt.ItemDataRole.EditRole)
+
+
+class _AccountCheckListItem(QListWidgetItem):
+    """QCheckBox-compatible adapter backed by QListWidget's item model."""
+
+    _SEARCH_ROLE = int(Qt.ItemDataRole.UserRole) + 1
+
+    def __init__(self, text: str, uid: str, search_text: str):
+        super().__init__(str(text))
+        self.setData(Qt.ItemDataRole.UserRole, str(uid))
+        self.setData(self._SEARCH_ROLE, str(search_text))
+        self.setFlags(self.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        self.setCheckState(Qt.CheckState.Unchecked)
+
+    def isChecked(self) -> bool:
+        return self.checkState() == Qt.CheckState.Checked
+
+    def setChecked(self, checked: bool) -> None:
+        self.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+
+    def setVisible(self, visible: bool) -> None:
+        self.setHidden(not bool(visible))
+
+    def property(self, name: str):
+        if name == "user_id":
+            return self.data(Qt.ItemDataRole.UserRole)
+        if name == "search_text":
+            return self.data(self._SEARCH_ROLE)
+        return None
+
+
 class _AutoItemSpinBox(QSpinBox):
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -3416,22 +3580,218 @@ class _AutoItemSpinBox(QSpinBox):
             return None
 
 
-class _AutoActionsMonitorTableItem(QTableWidgetItem):
-    def __init__(self, text="", sort_value=None):
-        super().__init__(str(text))
-        self._sort_value = str(text).casefold() if sort_value is None else sort_value
+class _AutoActionsMonitorTableModel(QAbstractTableModel):
+    """Virtual monitor table that only creates data for cells Qt is painting."""
 
-    def __lt__(self, other):
-        if isinstance(other, _AutoActionsMonitorTableItem):
-            left = self._sort_value
-            right = other._sort_value
+    HEADERS = ("User", "Action", "Status", "Next In", "Cooldown", "Context", "Trigger")
+    STATUS_COLORS = {
+        "ready": ModernStyle.SECONDARY,
+        "running": ModernStyle.PRIMARY,
+        "triggered": ModernStyle.PRIMARY,
+        "cooldown": ModernStyle.WARNING,
+        "alert": ModernStyle.WARNING,
+        "waiting": ModernStyle.TEXT_SECONDARY,
+        "blocked": ModernStyle.ERROR,
+        "disabled": ModernStyle.TEXT_SECONDARY,
+        "complete": ModernStyle.SECONDARY,
+    }
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._rows: List[Dict[str, Any]] = []
+        self._sort_column = 0
+        self._sort_order = Qt.SortOrder.AscendingOrder
+
+    @staticmethod
+    def _duration_text(seconds) -> str:
+        try:
+            value = max(0.0, float(seconds or 0.0))
+        except Exception:
+            value = 0.0
+        if value <= 0.0:
+            return "-"
+        total = int(value + 0.999)
+        hours, rem = divmod(total, 3600)
+        minutes, secs = divmod(rem, 60)
+        if hours:
+            return f"{hours:d}:{minutes:02d}:{secs:02d}"
+        return f"{minutes:d}:{secs:02d}"
+
+    @staticmethod
+    def _trigger_text(row: Dict[str, Any]) -> str:
+        trigger_type = str(row.get("trigger_type") or "normal")
+        if trigger_type == "ocr_filter":
+            return f"OCR ({len(row.get('trigger_filter_ids') or [])})"
+        if trigger_type == "merchant":
+            return f"Merchant ({len(row.get('trigger_merchants') or [])})"
+        if trigger_type == "action_row":
+            return "Action row"
+        return "Normal"
+
+    @staticmethod
+    def _context_text(row: Dict[str, Any]) -> str:
+        biome = str(row.get("biome") or "").strip()
+        try:
+            pid = int(row.get("pid", 0) or 0)
+        except Exception:
+            pid = 0
+        parts = []
+        if biome:
+            parts.append(biome)
+        if pid > 0:
+            parts.append(f"PID {pid}")
+        return "  /  ".join(parts) or "No window"
+
+    def _display_value(self, row: Dict[str, Any], column: int):
+        if column == 0:
+            return str(row.get("username") or row.get("uid") or "")
+        if column == 1:
+            return str(row.get("action_name") or "")
+        if column == 2:
+            return str(row.get("status_detail") or "")
+        if column == 3:
+            if str(row.get("status") or "") == "ready":
+                return "Now"
+            return self._duration_text(row.get("remaining_s"))
+        if column == 4:
+            return self._duration_text(row.get("cooldown_s"))
+        if column == 5:
+            return self._context_text(row)
+        if column == 6:
+            return self._trigger_text(row)
+        return ""
+
+    def _sort_value(self, row: Dict[str, Any], column: int):
+        if column == 3:
             try:
-                if isinstance(left, (int, float)) and isinstance(right, (int, float)):
-                    return float(left) < float(right)
-                return str(left).casefold() < str(right).casefold()
+                remaining = float(row.get("remaining_s", 0.0) or 0.0)
             except Exception:
-                pass
-        return super().__lt__(other)
+                remaining = 0.0
+            if str(row.get("status") or "") == "ready":
+                return 0.0
+            return remaining if remaining > 0.0 else float("inf")
+        if column == 4:
+            try:
+                return float(row.get("cooldown_s", 0.0) or 0.0)
+            except Exception:
+                return 0.0
+        return str(self._display_value(row, column)).casefold()
+
+    def set_rows(self, rows) -> None:
+        ordered = list(rows or [])
+        ordered.sort(
+            key=lambda row: self._sort_value(row, self._sort_column),
+            reverse=self._sort_order == Qt.SortOrder.DescendingOrder,
+        )
+        self.beginResetModel()
+        self._rows = ordered
+        self.endResetModel()
+
+    def rowCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self._rows)
+
+    def columnCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self.HEADERS)
+
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        if (
+            role == Qt.ItemDataRole.DisplayRole
+            and orientation == Qt.Orientation.Horizontal
+            and 0 <= int(section) < len(self.HEADERS)
+        ):
+            return self.HEADERS[int(section)]
+        return None
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid() or not (0 <= index.row() < len(self._rows)):
+            return None
+        row = self._rows[index.row()]
+        column = index.column()
+
+        if role == Qt.ItemDataRole.DisplayRole:
+            return self._display_value(row, column)
+
+        if role == Qt.ItemDataRole.ForegroundRole and column == 2:
+            color = self.STATUS_COLORS.get(
+                str(row.get("status") or ""),
+                ModernStyle.TEXT_PRIMARY,
+            )
+            return QBrush(QColor(color))
+
+        if role == Qt.ItemDataRole.FontRole and column == 2:
+            font = QFont()
+            font.setBold(True)
+            return font
+
+        if role != Qt.ItemDataRole.ToolTipRole:
+            return None
+
+        uid = str(row.get("uid") or "")
+        if column == 0:
+            return f"User ID: {uid}"
+        if column == 1:
+            mode = str(row.get("repeat_mode") or "repeat")
+            if mode == "once_per_pid":
+                mode_text = "Once / PID"
+            elif mode == "count":
+                mode_text = f"Max {int(row.get('repeat_count', 1) or 1)} / startup"
+            elif mode == "count_per_trigger":
+                mode_text = f"x{int(row.get('repeat_count', 1) or 1)} / trigger"
+            else:
+                mode_text = "Repeat"
+            allowed_biomes = list(row.get("allowed_biomes") or [])
+            return (
+                f"Action row {int(row.get('action_index', 0) or 0) + 1}\n"
+                f"Mode: {mode_text}\n"
+                f"Cooldown: {self._duration_text(row.get('cooldown_s'))}\n"
+                f"Startup delay: {self._duration_text(row.get('startup_delay_s'))}\n"
+                f"Biomes: {', '.join(allowed_biomes) if allowed_biomes else 'Any'}"
+            )
+        if column == 5:
+            menu_state = row.get("in_menu")
+            if menu_state is True:
+                menu_text = "In menu"
+            elif menu_state is False:
+                menu_text = "Out of menu"
+            else:
+                menu_text = "Menu state unknown"
+            return f"User ID: {uid}\n{menu_text}"
+        if column == 6:
+            last_trigger_at = float(row.get("last_trigger_at", 0.0) or 0.0)
+            last_trigger_text = (
+                self._duration_text(max(0.0, time.time() - last_trigger_at)) + " ago"
+                if last_trigger_at > 0.0
+                else "-"
+            )
+            trigger_type = str(row.get("trigger_type") or "normal")
+            if trigger_type == "ocr_filter":
+                filter_ids = list(row.get("trigger_filter_ids") or [])
+                return (
+                    "OCR filters: "
+                    + (", ".join(str(value) for value in filter_ids) if filter_ids else "None")
+                    + f"\nLast trigger: {last_trigger_text}"
+                )
+            if trigger_type == "merchant":
+                merchants = list(row.get("trigger_merchants") or [])
+                return (
+                    "Merchants: "
+                    + (", ".join(str(value) for value in merchants) if merchants else "None")
+                    + f"\nLast trigger: {last_trigger_text}"
+                )
+            return "Runs without an event trigger."
+        return None
+
+    def sort(self, column, order=Qt.SortOrder.AscendingOrder):
+        if not 0 <= int(column) < len(self.HEADERS):
+            return
+        self._sort_column = int(column)
+        self._sort_order = order
+        self.layoutAboutToBeChanged.emit()
+        self._rows.sort(
+            key=lambda row: self._sort_value(row, self._sort_column),
+            reverse=self._sort_order == Qt.SortOrder.DescendingOrder,
+        )
+        self.layoutChanged.emit()
 
 
 class _AutoActionsMonitorHeader(QHeaderView):
@@ -3515,6 +3875,8 @@ class _AutoActionsMonitorHeader(QHeaderView):
 
 
 class _AutoActionsMonitorDialog(QDialog):
+    _snapshot_result = Signal(object, object)
+
     def __init__(self, snapshot_provider, parent=None):
         super().__init__(parent)
         self._snapshot_provider = snapshot_provider
@@ -3597,7 +3959,7 @@ class _AutoActionsMonitorDialog(QDialog):
                 background-color: {ModernStyle.SURFACE};
                 border-color: {ModernStyle.PRIMARY};
             }}
-            QDialog#autoActionsMonitor QTableWidget {{
+            QDialog#autoActionsMonitor QTableView {{
                 color: {ModernStyle.TEXT_PRIMARY};
                 background-color: {ModernStyle.SURFACE};
                 alternate-background-color: {ModernStyle.SURFACE};
@@ -3608,13 +3970,13 @@ class _AutoActionsMonitorDialog(QDialog):
                 selection-color: {ModernStyle.TEXT_PRIMARY};
                 outline: none;
             }}
-            QDialog#autoActionsMonitor QTableWidget::item {{
+            QDialog#autoActionsMonitor QTableView::item {{
                 color: {ModernStyle.TEXT_PRIMARY};
                 background-color: transparent;
                 border-bottom: 1px solid {ModernStyle.BORDER};
                 padding: 7px 9px;
             }}
-            QDialog#autoActionsMonitor QTableWidget::item:selected {{
+            QDialog#autoActionsMonitor QTableView::item:selected {{
                 color: {ModernStyle.TEXT_PRIMARY};
                 background-color: {ModernStyle.PRIMARY_VARIANT};
             }}
@@ -3715,19 +4077,9 @@ class _AutoActionsMonitorDialog(QDialog):
         controls.addWidget(refresh_btn)
         layout.addLayout(controls)
 
-        self.table = QTableWidget()
-        self.table.setColumnCount(7)
-        self.table.setHorizontalHeaderLabels(
-            [
-                "User",
-                "Action",
-                "Status",
-                "Next In",
-                "Cooldown",
-                "Context",
-                "Trigger",
-            ]
-        )
+        self.table = QTableView()
+        self._table_model = _AutoActionsMonitorTableModel(self.table)
+        self.table.setModel(self._table_model)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -3742,6 +4094,7 @@ class _AutoActionsMonitorDialog(QDialog):
         header.setSectionsClickable(True)
         header.setHighlightSections(False)
         header.setMinimumSectionSize(90)
+        header.setResizeContentsPrecision(100)
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
@@ -3751,6 +4104,7 @@ class _AutoActionsMonitorDialog(QDialog):
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
         self.table.setSortingEnabled(True)
+        self.table.sortByColumn(0, Qt.SortOrder.AscendingOrder)
         header.setSortIndicatorShown(True)
         header.setSortIndicator(0, Qt.SortOrder.AscendingOrder)
         layout.addWidget(self.table, 1)
@@ -3774,6 +4128,9 @@ class _AutoActionsMonitorDialog(QDialog):
         layout.addLayout(footer)
 
         self._latest_snapshot = {}
+        self._browse_choices_signature = None
+        self._snapshot_in_flight = False
+        self._snapshot_result.connect(self._on_snapshot_result)
         self.browse_mode.currentIndexChanged.connect(self._on_browse_mode_changed)
         self.browse_selection.currentIndexChanged.connect(self._populate_table)
         self.filter_edit.textChanged.connect(self._populate_table)
@@ -3782,6 +4139,13 @@ class _AutoActionsMonitorDialog(QDialog):
         self._refresh_timer.setInterval(1000)
         self._refresh_timer.timeout.connect(self.refresh)
         self._refresh_timer.start()
+        self.engine_stat.setText("Loading...")
+        self.users_stat.setText("Loading...")
+        self.active_stat.setText("Loading...")
+        self.attention_stat.setText("Loading...")
+        self.empty_label.setText("Loading monitor data...")
+        self.table.hide()
+        self.empty_label.show()
         self.refresh()
 
     def _on_browse_mode_changed(self, *_):
@@ -3792,36 +4156,49 @@ class _AutoActionsMonitorDialog(QDialog):
         rows = list((self._latest_snapshot or {}).get("rows") or [])
         mode = str(self.browse_mode.currentData() or "user")
         previous = self.browse_selection.currentData()
+        if mode == "action":
+            actions = {}
+            for row in rows:
+                try:
+                    action_index = int(row.get("action_index", 0) or 0)
+                except Exception:
+                    action_index = 0
+                actions.setdefault(action_index, str(row.get("action_name") or f"Action {action_index + 1}"))
+            choices = tuple(
+                sorted(
+                    actions.items(),
+                    key=lambda entry: (str(entry[1]).casefold(), int(entry[0])),
+                )
+            )
+            self.browse_hint.setText("Choose an action to view its users.")
+        else:
+            users = {}
+            for row in rows:
+                uid = str(row.get("uid") or "").strip()
+                if uid:
+                    users.setdefault(uid, str(row.get("username") or uid))
+            choices = tuple(
+                sorted(
+                    users.items(),
+                    key=lambda entry: (str(entry[1]).casefold(), str(entry[0])),
+                )
+            )
+            self.browse_hint.setText("Choose a user to view their actions.")
+
+        signature = (mode, choices)
+        if signature == self._browse_choices_signature:
+            return
+        self._browse_choices_signature = signature
         self.browse_selection.blockSignals(True)
         try:
             self.browse_selection.clear()
             if mode == "action":
-                self.browse_hint.setText("Choose an action to view its users.")
                 self.browse_selection.addItem("All actions", -1)
-                actions = {}
-                for row in rows:
-                    try:
-                        action_index = int(row.get("action_index", 0) or 0)
-                    except Exception:
-                        action_index = 0
-                    actions.setdefault(action_index, str(row.get("action_name") or f"Action {action_index + 1}"))
-                for action_index, action_name in sorted(
-                    actions.items(),
-                    key=lambda entry: (str(entry[1]).casefold(), int(entry[0])),
-                ):
+                for action_index, action_name in choices:
                     self.browse_selection.addItem(f"#{action_index + 1}  {action_name}", action_index)
             else:
-                self.browse_hint.setText("Choose a user to view their actions.")
                 self.browse_selection.addItem("All users", "")
-                users = {}
-                for row in rows:
-                    uid = str(row.get("uid") or "").strip()
-                    if uid:
-                        users.setdefault(uid, str(row.get("username") or uid))
-                for uid, username in sorted(
-                    users.items(),
-                    key=lambda entry: (str(entry[1]).casefold(), str(entry[0])),
-                ):
+                for uid, username in choices:
                     self.browse_selection.addItem(username, uid)
                     item_index = self.browse_selection.count() - 1
                     self.browse_selection.setItemData(
@@ -3850,18 +4227,43 @@ class _AutoActionsMonitorDialog(QDialog):
             return f"{hours:d}:{minutes:02d}:{secs:02d}"
         return f"{minutes:d}:{secs:02d}"
 
-    def refresh(self):
-        try:
-            snapshot = self._snapshot_provider() or {}
-        except Exception as exc:
+    def refresh(self, *_):
+        # Coalesce timer ticks and manual refreshes while a large snapshot is
+        # being built. The Auto-Actions providers are already designed for use
+        # by the engine's worker thread, so collection does not belong on Qt's
+        # event loop.
+        if self._snapshot_in_flight:
+            return
+        self._snapshot_in_flight = True
+        provider = self._snapshot_provider
+
+        def _collect_snapshot() -> None:
+            try:
+                snapshot = provider() or {}
+                error = None
+            except Exception as exc:
+                snapshot = None
+                error = str(exc)
+            try:
+                self._snapshot_result.emit(snapshot, error)
+            except RuntimeError:
+                # The dialog may have closed while collection was in flight.
+                pass
+
+        QThreadPool.globalInstance().start(_FunctionRunnable(_collect_snapshot))
+
+    def _on_snapshot_result(self, snapshot, error):
+        self._snapshot_in_flight = False
+        if error is not None:
             self.engine_stat.setText(
                 f"<span style='color:{ModernStyle.ERROR}; font-weight:700;'>Unavailable</span><br>"
                 "<span style='color:{0};'>Engine</span>".format(ModernStyle.TEXT_SECONDARY)
             )
-            self.empty_label.setText(f"Monitor data is unavailable.\n{exc}")
+            self.empty_label.setText(f"Monitor data is unavailable.\n{error}")
             self.table.hide()
             self.empty_label.show()
             return
+        snapshot = snapshot or {}
         self._latest_snapshot = snapshot
         self._refresh_browse_choices()
         running = bool(snapshot.get("engine_running", False))
@@ -3989,144 +4391,7 @@ class _AutoActionsMonitorDialog(QDialog):
 
         self.empty_label.hide()
         self.table.show()
-        status_colors = {
-            "ready": ModernStyle.SECONDARY,
-            "running": ModernStyle.PRIMARY,
-            "triggered": ModernStyle.PRIMARY,
-            "cooldown": ModernStyle.WARNING,
-            "alert": ModernStyle.WARNING,
-            "waiting": ModernStyle.TEXT_SECONDARY,
-            "blocked": ModernStyle.ERROR,
-            "disabled": ModernStyle.TEXT_SECONDARY,
-            "complete": ModernStyle.SECONDARY,
-        }
-        self.table.setUpdatesEnabled(False)
-        table_header = self.table.horizontalHeader()
-        sort_column = table_header.sortIndicatorSection()
-        sort_order = table_header.sortIndicatorOrder()
-        sorting_enabled = self.table.isSortingEnabled()
-        if sorting_enabled:
-            self.table.setSortingEnabled(False)
-        try:
-            self.table.setRowCount(len(rows))
-            for table_row, row in enumerate(rows):
-                trigger_type = str(row.get("trigger_type") or "normal")
-                filter_count = len(row.get("trigger_filter_ids") or [])
-                merchant_count = len(row.get("trigger_merchants") or [])
-                if trigger_type == "ocr_filter":
-                    trigger_text = f"OCR ({filter_count})"
-                elif trigger_type == "merchant":
-                    trigger_text = f"Merchant ({merchant_count})"
-                elif trigger_type == "action_row":
-                    trigger_text = "Action row"
-                else:
-                    trigger_text = "Normal"
-                mode = str(row.get("repeat_mode") or "repeat")
-                if mode == "once_per_pid":
-                    mode_text = "Once / PID"
-                elif mode == "count":
-                    mode_text = f"Max {int(row.get('repeat_count', 1) or 1)} / startup"
-                elif mode == "count_per_trigger":
-                    mode_text = f"x{int(row.get('repeat_count', 1) or 1)} / trigger"
-                else:
-                    mode_text = "Repeat"
-                last_trigger_at = float(row.get("last_trigger_at", 0.0) or 0.0)
-                last_trigger_text = (
-                    self._duration_text(max(0.0, time.time() - last_trigger_at)) + " ago"
-                    if last_trigger_at > 0.0
-                    else "-"
-                )
-                username = str(row.get("username") or row.get("uid") or "")
-                uid = str(row.get("uid") or "")
-                status_key = str(row.get("status") or "")
-                next_in = self._duration_text(row.get("remaining_s"))
-                if status_key == "ready":
-                    next_in = "Now"
-                pid = int(row.get("pid", 0) or 0)
-                biome = str(row.get("biome") or "").strip()
-                context_parts = []
-                if biome:
-                    context_parts.append(biome)
-                if pid > 0:
-                    context_parts.append(f"PID {pid}")
-                context_text = "  /  ".join(context_parts) or "No window"
-                values = [
-                    username,
-                    str(row.get("action_name") or ""),
-                    str(row.get("status_detail") or ""),
-                    next_in,
-                    self._duration_text(row.get("cooldown_s")),
-                    context_text,
-                    trigger_text,
-                ]
-                remaining_value = float(row.get("remaining_s", 0.0) or 0.0)
-                if status_key == "ready":
-                    remaining_sort = 0.0
-                elif remaining_value > 0.0:
-                    remaining_sort = remaining_value
-                else:
-                    remaining_sort = float("inf")
-                sort_values = [
-                    username,
-                    str(row.get("action_name") or ""),
-                    str(row.get("status_detail") or ""),
-                    remaining_sort,
-                    float(row.get("cooldown_s", 0.0) or 0.0),
-                    context_text,
-                    trigger_text,
-                ]
-                for column, value in enumerate(values):
-                    item = _AutoActionsMonitorTableItem(value, sort_values[column])
-                    if column == 0:
-                        item.setToolTip(f"User ID: {uid}")
-                    elif column == 1:
-                        allowed_biomes = list(row.get("allowed_biomes") or [])
-                        item.setToolTip(
-                            f"Action row {int(row.get('action_index', 0) or 0) + 1}\n"
-                            f"Mode: {mode_text}\n"
-                            f"Cooldown: {self._duration_text(row.get('cooldown_s'))}\n"
-                            f"Startup delay: {self._duration_text(row.get('startup_delay_s'))}\n"
-                            f"Biomes: {', '.join(allowed_biomes) if allowed_biomes else 'Any'}"
-                        )
-                    elif column == 2:
-                        color = status_colors.get(status_key, ModernStyle.TEXT_PRIMARY)
-                        item.setForeground(QBrush(QColor(color)))
-                        status_font = item.font()
-                        status_font.setBold(True)
-                        item.setFont(status_font)
-                    elif column == 5:
-                        menu_state = row.get("in_menu")
-                        if menu_state is True:
-                            menu_text = "In menu"
-                        elif menu_state is False:
-                            menu_text = "Out of menu"
-                        else:
-                            menu_text = "Menu state unknown"
-                        item.setToolTip(f"User ID: {uid}\n{menu_text}")
-                    elif column == 6:
-                        filter_ids = list(row.get("trigger_filter_ids") or [])
-                        if trigger_type == "ocr_filter":
-                            item.setToolTip(
-                                "OCR filters: "
-                                + (", ".join(str(value) for value in filter_ids) if filter_ids else "None")
-                                + f"\nLast trigger: {last_trigger_text}"
-                            )
-                        elif trigger_type == "merchant":
-                            merchants = list(row.get("trigger_merchants") or [])
-                            item.setToolTip(
-                                "Merchants: "
-                                + (", ".join(str(value) for value in merchants) if merchants else "None")
-                                + f"\nLast trigger: {last_trigger_text}"
-                            )
-                        else:
-                            item.setToolTip("Runs without an event trigger.")
-                    self.table.setItem(table_row, column, item)
-        finally:
-            if sorting_enabled:
-                self.table.setSortingEnabled(True)
-                if 0 <= int(sort_column) < self.table.columnCount():
-                    self.table.sortItems(int(sort_column), sort_order)
-            self.table.setUpdatesEnabled(True)
+        self._table_model.set_rows(rows)
 
 
 class WorkerThread(QThread):
@@ -4198,6 +4463,11 @@ class WorkerThread(QThread):
 
         self._last_proc_count = 0
         self._last_growth_ts  = time.time()
+        self._active_pids_by_uid: Dict[str, Tuple[int, ...]] = {}
+        self._last_process_snapshot: Optional[dict] = None
+        self._server_context_by_label: Dict[str, Tuple[str, str]] = {}
+        self._private_server_owner_by_code: Dict[str, str] = {}
+        self._username_uid_index: Dict[str, str] = {}
         self.log_inactivity_timeout = DEFAULT_CAP_WATCHDOG_SETTINGS["in_menu_none_timeout_seconds"]
         self._action_queue = queue.Queue()
         self._antiafk_action_lock = threading.Lock()
@@ -4206,6 +4476,8 @@ class WorkerThread(QThread):
         # Multiscope
         self.ms = None  # ← NEW: MultiScopeEngine instance
         
+        self._multiscope_user_grace_until: Dict[str, float] = {}
+        self._multiscope_synced_user_ids: Tuple[str, ...] = ()
         self._last_good_set = set()  # tracks which users are currently 'good' (flagged/disabled == False)
         self._reservations_ttl = 60  # seconds a server is "held" by a handoff pre-join
         self.preconnect_grace = DEFAULT_CAP_WATCHDOG_SETTINGS["missing_username_timeout_seconds"]
@@ -5614,6 +5886,114 @@ class WorkerThread(QThread):
             self.log_signal.emit(f"[SCAN-TRACE] {uid}: {msg}")
             self._trace_ts[key] = now
 
+    @staticmethod
+    def _private_server_code_from_link(link: str) -> str:
+        text = str(link or "")
+        match = re.search(r"privateServerLinkCode=([A-Za-z0-9_-]+)", text)
+        if match:
+            return match.group(1)
+        match = re.search(r"/share\?code=([A-Za-z0-9_-]+)&type=Server", text)
+        return match.group(1) if match else ""
+
+    def _rebuild_account_lookup_indexes(self) -> None:
+        """Build O(1) indexes used by every-user heartbeat lookups."""
+        owners: Dict[str, str] = {}
+        usernames: Dict[str, str] = {}
+        settings = getattr(self.manager, "settings", {}) if self.manager else {}
+        if not isinstance(settings, dict):
+            settings = {}
+        for raw_uid, raw_info in settings.items():
+            uid = str(raw_uid)
+            info = raw_info if isinstance(raw_info, dict) else {}
+            username = str(info.get("username") or "").strip()
+            if username:
+                usernames[username.lower()] = uid
+            code = self._private_server_code_from_link(info.get("private_server_link", ""))
+            if code:
+                owners.setdefault(code, username)
+        self._private_server_owner_by_code = owners
+        self._username_uid_index = usernames
+
+    def _refresh_process_server_context_index(self) -> None:
+        """Index one usable private-server context per live server label."""
+        contexts: Dict[str, Tuple[str, str]] = {}
+        tracker = getattr(self.manager, "process_tracker", None) if self.manager else None
+        if tracker is not None:
+            labels = getattr(tracker, "user_server", {}) or {}
+            codes = getattr(tracker, "user_ps_code", {}) or {}
+            places = getattr(tracker, "user_ps_place", {}) or {}
+            for uid, label in labels.items():
+                code = str(codes.get(uid, "") or "").strip()
+                if label and code:
+                    contexts.setdefault(str(label), (code, str(places.get(uid, "") or "")))
+        self._server_context_by_label = contexts
+
+    def _get_ps_link_for_user_fast(self, uid: str) -> str:
+        uid = str(uid)
+        state = self.user_states.get(uid, {}) if isinstance(self.user_states, dict) else {}
+        state_info = state.get("user_info", {}) if isinstance(state, dict) else {}
+        settings = getattr(self.manager, "settings", {}) if self.manager else {}
+        cfg_info = settings.get(uid, {}) if isinstance(settings, dict) else {}
+        if bool(
+            (isinstance(state_info, dict) and (state_info.get("bad", False) or state_info.get("cap", False)))
+            or (isinstance(cfg_info, dict) and (cfg_info.get("bad", False) or cfg_info.get("cap", False)))
+        ):
+            return ""
+        tracker = self.manager.process_tracker
+        code = str((tracker.user_ps_code or {}).get(uid, "") or "").strip()
+        place = str((tracker.user_ps_place or {}).get(uid, "") or "").strip()
+        if not code:
+            label = str((tracker.user_server or {}).get(uid, "") or "")
+            code, place = self._server_context_by_label.get(label, ("", ""))
+        if not code:
+            return ""
+        place = str(place or self.manager.target_place or "15532962292").strip()
+        return f"https://www.roblox.com/games/{place}/join?privateServerLinkCode={code}"
+
+    def _get_owner_for_user_fast(self, uid: str) -> str:
+        uid = str(uid)
+        tracker = self.manager.process_tracker
+        owner = str((tracker.server_owner or {}).get(uid, "") or "").strip()
+        if owner:
+            return owner
+        code = str((tracker.user_ps_code or {}).get(uid, "") or "").strip()
+        if not code:
+            label = str((tracker.user_server or {}).get(uid, "") or "")
+            match = re.search(r"PS[:\s\u2022-]*([A-Za-z0-9_-]{5,})", label, re.I)
+            code = match.group(1) if match else ""
+        owner = self._private_server_owner_by_code.get(code, "")
+        if owner:
+            return owner
+        info = (getattr(self.manager, "settings", {}) or {}).get(uid, {})
+        return str(info.get("username", "") if isinstance(info, dict) else "").strip()
+
+    def _snapshot_active_tracked_processes(self) -> Dict[str, Tuple[int, ...]]:
+        """Verify each tracked PID at most once during a manager heartbeat."""
+        active: Dict[str, Tuple[int, ...]] = {}
+        verified: Dict[int, bool] = {}
+        tracker = getattr(self.manager, "process_tracker", None) if self.manager else None
+        user_processes = getattr(tracker, "user_processes", {}) if tracker is not None else {}
+        for raw_uid, raw_pids in list((user_processes or {}).items()):
+            live: List[int] = []
+            for raw_pid in list(raw_pids or []):
+                try:
+                    pid = int(raw_pid)
+                except Exception:
+                    continue
+                is_active = verified.get(pid)
+                if is_active is None:
+                    try:
+                        is_active = bool(self.process_mgr.verify_process_active(pid))
+                    except Exception:
+                        is_active = False
+                    verified[pid] = is_active
+                if is_active:
+                    live.append(pid)
+            if live:
+                active[str(raw_uid)] = tuple(live)
+        self._active_pids_by_uid = active
+        return active
+
     # -------------- pools ---------------------
     def _recompute_pools(self):
         previous_pool_state = (
@@ -5715,10 +6095,14 @@ class WorkerThread(QThread):
             if is_bad_live or is_cap_live or is_bad_cfg or is_cap_cfg or is_disabled_live or is_disabled_cfg:
                 continue
 
-            live = [
-                pid for pid in self.manager.process_tracker.user_processes.get(uid, [])
-                if self.process_mgr.verify_process_active(pid)
-            ]
+            cached_live = getattr(self, "_active_pids_by_uid", None)
+            if isinstance(cached_live, dict):
+                live = list(cached_live.get(uid, ()))
+            else:
+                live = [
+                    pid for pid in self.manager.process_tracker.user_processes.get(uid, [])
+                    if self.process_mgr.verify_process_active(pid)
+                ]
             if live:
                 continue
 
@@ -5740,35 +6124,13 @@ class WorkerThread(QThread):
         if not elig:
             return None
 
-        # Load users.json once
-        try:
-            users_cfg = self.cfg_manager.peek_users() or {}
-        except Exception:
-            users_cfg = {}
-
-        # Quick helpers
-        import re
-        def _code_from_link(link: str) -> str:
-            if not link:
-                return ""
-            m = re.search(r'privateServerLinkCode=([A-Za-z0-9_-]+)', link)
-            if m:
-                return m.group(1)
-            m = re.search(r'/share\?code=([A-Za-z0-9_-]+)&type=Server', link)
-            return m.group(1) if m else ""
-
         # Resolve owner UID by code first, then by username
         owner_uid = None
         if target_code:
-            for _uid, info in users_cfg.items():
-                if _code_from_link((info.get("private_server_link") or "").strip()) == target_code:
-                    owner_uid = _uid
-                    break
+            owner_name = self._private_server_owner_by_code.get(target_code, "")
+            owner_uid = self._username_uid_index.get(owner_name.lower()) if owner_name else None
         if not owner_uid and target_owner:
-            for _uid, info in users_cfg.items():
-                if (info.get("username","").strip().lower() == target_owner):
-                    owner_uid = _uid
-                    break
+            owner_uid = self._username_uid_index.get(target_owner)
 
         owners, others = [], []
         for uid in elig:
@@ -5944,7 +6306,7 @@ class WorkerThread(QThread):
         override["allow_shared_server"] = True  # handoff exception: joining donor’s live server
 
         # Double-check disk flags
-        users_cfg = self.cfg_manager.load_users() or {}
+        users_cfg = self.cfg_manager.peek_users() or {}
         if users_cfg.get(spare_uid, {}).get("bad", False) or users_cfg.get(spare_uid, {}).get("cap", False):
             self._log(f"Skip spare {spare_uid}: marked flagged in users.json")
             return False
@@ -6071,11 +6433,41 @@ class WorkerThread(QThread):
         except Exception:
             pass
 
-    def _sync_multiscope_user_list(self) -> None:
+    def _sync_multiscope_user_list(
+        self,
+        active_pids_by_uid: Optional[Dict[str, Sequence[int]]] = None,
+        *,
+        force: bool = False,
+    ) -> None:
         if not self.ms or not isinstance(getattr(self, "user_states", None), dict):
             return
         try:
-            user_ids = [str(uid) for uid in self.user_states.keys()]
+            if active_pids_by_uid is None:
+                cached = getattr(self, "_active_pids_by_uid", None)
+                if isinstance(cached, dict):
+                    active_pids_by_uid = cached
+                else:
+                    tracker = getattr(self.manager, "process_tracker", None) if self.manager else None
+                    active_pids_by_uid = getattr(tracker, "user_processes", {}) if tracker else {}
+            # Keep a short post-exit grace for final buffered log lines while
+            # excluding the hundreds of configured users that have no process.
+            now_mono = time.monotonic()
+            grace = getattr(self, "_multiscope_user_grace_until", None)
+            if not isinstance(grace, dict):
+                grace = {}
+                self._multiscope_user_grace_until = grace
+            live_uids = {
+                str(uid)
+                for uid, pids in (active_pids_by_uid or {}).items()
+                if pids and str(uid) in self.user_states
+            }
+            for uid in live_uids:
+                grace[uid] = now_mono + 6.0
+            for uid, expires_at in list(grace.items()):
+                if uid not in self.user_states or (uid not in live_uids and float(expires_at) <= now_mono):
+                    grace.pop(uid, None)
+            user_ids = sorted(grace)
+            self._multiscope_synced_user_ids = tuple(user_ids)
             usernames_by_uid: dict[str, str] = {}
             cookies_by_uid: dict[str, str] = {}
             settings = getattr(self.manager, "settings", {}) if self.manager else {}
@@ -6090,7 +6482,7 @@ class WorkerThread(QThread):
             sync_signature = tuple(
                 sorted((uid, usernames_by_uid.get(uid, ""), cookies_by_uid.get(uid, "")) for uid in user_ids)
             )
-            if getattr(self, "_last_multiscope_user_sync_signature", None) == sync_signature:
+            if not force and getattr(self, "_last_multiscope_user_sync_signature", None) == sync_signature:
                 return
             self._last_multiscope_user_sync_signature = sync_signature
             self.ms.update_users(
@@ -6100,7 +6492,7 @@ class WorkerThread(QThread):
             )
         except TypeError:
             try:
-                self.ms.update_users([str(uid) for uid in self.user_states.keys()])
+                self.ms.update_users(user_ids)
             except Exception:
                 pass
         except Exception:
@@ -6148,6 +6540,11 @@ class WorkerThread(QThread):
                     "status"         : "Initializing"
                 } for uid, info in self.manager.settings.items()
             }
+            self._rebuild_account_lookup_indexes()
+            try:
+                self._users_runtime_signature_seen = self.cfg_manager.get_users_runtime_signature()
+            except Exception:
+                self._users_runtime_signature_seen = None
             self.timing_trackers = {'window': 0, 'cleanup': 0, 'relaunch': 0}
 
             # Restore and publish process ownership before starting the cold
@@ -6170,6 +6567,7 @@ class WorkerThread(QThread):
                 return str(info.get("username", ""))
 
             def _get_ps_link(uid: str) -> str:
+                return self._get_ps_link_for_user_fast(uid)
                 # Hide link if this account is currently flagged
                 st = self.user_states.get(uid, {}) if hasattr(self, "user_states") else {}
                 is_flagged = bool(
@@ -6209,6 +6607,7 @@ class WorkerThread(QThread):
 
             # Prefer owner from main.py tracker; fallback to users.json by matching PS code
             def _get_owner_for_ms(uid: str) -> str:
+                return self._get_owner_for_user_fast(uid)
                 # 1) main.py authoritative owner (separate path)
                 owner = self.manager.process_tracker.server_owner.get(uid, "")
                 if owner:
@@ -6255,8 +6654,9 @@ class WorkerThread(QThread):
             self.get_owner_for_user = _get_owner_for_ms
             self.get_username_for_user = _get_username
 
-            usernames_by_uid = {str(uid): _get_username(str(uid)) for uid in self.user_states.keys()}
-            cookies_by_uid = {str(uid): _get_cookie(str(uid)) for uid in self.user_states.keys()}
+            initial_active = self._snapshot_active_tracked_processes()
+            usernames_by_uid = {uid: _get_username(uid) for uid in initial_active}
+            cookies_by_uid = {uid: _get_cookie(uid) for uid in initial_active}
 
             self.ms = MultiScopeProcessProxy(
                 usernames_by_uid=usernames_by_uid,
@@ -6267,8 +6667,7 @@ class WorkerThread(QThread):
 
 
 
-            # Provide full user list AFTER user_states are built
-            self._sync_multiscope_user_list()
+            self._sync_multiscope_user_list(initial_active, force=True)
 
             # Push the settings loaded before MultiScope startup.
             self._apply_multiscope_webhook_settings(cfg)
@@ -6615,21 +7014,21 @@ class WorkerThread(QThread):
                 self._drain_action_queue()
                 now = time.time()
                 
-                # ---- Hot reload users.json (propagate flag flips, etc.) ----
+                # ---- Hot reload meaningful account settings ----
                 fresh_map = None
                 try:
-                    users_mtime = float(self.cfg_manager.get_users_mtime())
+                    users_signature = self.cfg_manager.get_users_runtime_signature()
                 except Exception:
-                    users_mtime = 0.0
-                if getattr(self, "_users_mtime_seen", None) != users_mtime:
-                    self._users_mtime_seen = users_mtime
+                    users_signature = None
+                if getattr(self, "_users_runtime_signature_seen", None) != users_signature:
+                    self._users_runtime_signature_seen = users_signature
                     try:
                         fresh_map = self.cfg_manager.get_users_for_manager() or {}
                     except Exception:
                         fresh_map = {}
 
                 # Only do work if something actually changed
-                if fresh_map and fresh_map != self.manager.settings:
+                if fresh_map is not None and fresh_map != self.manager.settings:
                     old_ids = set(self.manager.settings.keys())
                     new_ids = set(fresh_map.keys())
 
@@ -6663,6 +7062,7 @@ class WorkerThread(QThread):
 
                     # 2) Replace settings (source of truth for user_info)
                     self.manager.settings = fresh_map
+                    self._rebuild_account_lookup_indexes()
 
                     # 3) Update existing users in-place so flags/cookies/links apply immediately
                     now2 = time.time()
@@ -6755,7 +7155,7 @@ class WorkerThread(QThread):
 
                     # Keep the out-of-process MultiScope engine aware of live
                     # users and their metadata after users.json hot reloads.
-                    self._sync_multiscope_user_list()
+                    self._sync_multiscope_user_list(force=True)
 
                 # housekeeping: clean dead processes
                 if 'cleanup' not in self.timing_trackers:
@@ -6797,52 +7197,19 @@ class WorkerThread(QThread):
                 self._enforce_one_per_server()
                 self._prune_reservations()
 
-                # --- sync flags + evict from pools immediately ---
-                try:
-                    changed = False
-                    for uid, cfg_info in list(self.manager.settings.items()):
-                        st = self.user_states.get(uid)
-                        if not st:
-                            continue
-                        bad_disk = bool(cfg_info.get("bad", False))
-                        cap_disk = bool(cfg_info.get("cap", False))
-                        if st["user_info"].get("bad", False) != bad_disk:
-                            st["user_info"]["bad"] = bad_disk
-                            changed = True
-                        if st["user_info"].get("cap", False) != cap_disk:
-                            st["user_info"]["cap"] = cap_disk
-                            changed = True
-
-                        # If flagged, evict from both pools and cancel any in-flight handoff roles
-                        if bad_disk or cap_disk:
-                            if uid in self.active_pool or uid in self.spare_pool:
-                                self.active_pool.discard(uid)
-                                self.spare_pool.discard(uid)
-                                changed = True
-                        # If this flagged user is being used as a spare for a donor, cancel it
-                            donors = [d for d, s in list(self.handoff_for.items()) if s == uid]
-                            for d in donors:
-                                self.handoff_for.pop(d, None)
-                    if changed and self.spares_mode:
-                        self._recompute_pools()
-                except Exception as _e:
-                    self._log(f"[Sync] flag sync error: {_e}")
-
-                # Count live processes and guard against stalls
-                active_processes = sum(
-                    len([pid for pid in self.manager.process_tracker.user_processes.get(uid, [])
-                        if self.process_mgr.verify_process_active(pid)])
-                    for uid in list(self.manager.settings.keys())
-                )
-                total_users = len(self.manager.settings)
+                # Verify tracked processes once and reuse the snapshot throughout
+                # this heartbeat (status, watchdog, handoff, MultiScope, PID table).
+                active_pids_by_uid = self._snapshot_active_tracked_processes()
+                active_accounts = len(active_pids_by_uid)
+                launch_target = len(self.active_pool)
                 STUCK_TIMEOUT = self.manager.check_intervals.get('stuck_guard', 90)
 
-                if active_processes > self._last_proc_count:
-                    self._last_proc_count = active_processes
+                if active_accounts > self._last_proc_count:
+                    self._last_proc_count = active_accounts
                     self._last_growth_ts = now
                 else:
-                    self._last_proc_count = active_processes
-                if active_processes < total_users and (now - self._last_growth_ts) >= STUCK_TIMEOUT:
+                    self._last_proc_count = active_accounts
+                if active_accounts < launch_target and (now - self._last_growth_ts) >= STUCK_TIMEOUT:
                     limit_strap_helpers(threshold=1, kill_all=False)
                     self._last_growth_ts = now
 
@@ -6858,12 +7225,10 @@ class WorkerThread(QThread):
                 try:
                     oldest_live_created_at = None
                     tracker = self.manager.process_tracker
-                    for tracked_pids in (tracker.user_processes or {}).values():
-                        for raw_pid in list(tracked_pids or []):
+                    for tracked_pids in active_pids_by_uid.values():
+                        for raw_pid in tracked_pids:
                             try:
                                 pid = int(raw_pid)
-                                if not self.process_mgr.verify_process_active(pid):
-                                    continue
                                 created_at = float((tracker.creation_timestamps or {}).get(pid, 0.0) or 0.0)
                             except Exception:
                                 continue
@@ -6878,6 +7243,8 @@ class WorkerThread(QThread):
                     )
                 except Exception:
                     pass
+
+                self._refresh_process_server_context_index()
 
                 for uid, st in list(self.user_states.items()):
                     info = st["user_info"]
@@ -6913,29 +7280,29 @@ class WorkerThread(QThread):
                         st["requires_restart"] = False
                         continue
                     
-                    ps_link = ""
-                    try:
-                        fn = getattr(self, "get_ps_link_for_user", None)
-                        if callable(fn):
-                            ps_link = str(fn(uid) or "")
-                    except Exception:
-                        ps_link = ""
-                    server_owner = ""
-                    try:
-                        fn = getattr(self, "get_owner_for_user", None)
-                        if callable(fn):
-                            server_owner = str(fn(uid) or "")
-                    except Exception:
-                        server_owner = ""
-
-                    live = [pid for pid in self.manager.process_tracker.user_processes.get(uid, [])
-                            if self.process_mgr.verify_process_active(pid)]
+                    live = list(active_pids_by_uid.get(uid, ()))
                     live_by_uid[uid] = bool(live)
                     if live:
                         try:
                             self._restore_live_user_server_label(uid, info)
                         except Exception:
                             pass
+
+                    ps_link = ""
+                    server_owner = ""
+                    if live:
+                        try:
+                            fn = getattr(self, "get_ps_link_for_user", None)
+                            if callable(fn):
+                                ps_link = str(fn(uid) or "")
+                        except Exception:
+                            ps_link = ""
+                        try:
+                            fn = getattr(self, "get_owner_for_user", None)
+                            if callable(fn):
+                                server_owner = str(fn(uid) or "")
+                        except Exception:
+                            server_owner = ""
                     
                     # --- NEW: pre-connect watchdog -------------------------------------------
                     # Count only healthy, conclusive misses toward the shared six-minute
@@ -7056,10 +7423,7 @@ class WorkerThread(QThread):
                     # donor standby
                     if self.spares_mode and uid in self.handoff_for:
                         spare_uid = self.handoff_for[uid]
-                        spare_live = any(
-                            self.process_mgr.verify_process_active(pid)
-                            for pid in self.manager.process_tracker.user_processes.get(spare_uid, [])
-                        )
+                        spare_live = bool(active_pids_by_uid.get(spare_uid))
                         if spare_live:
                             st["status"] = "Standby (handoff)"
                             st["requires_restart"] = False
@@ -7169,7 +7533,20 @@ class WorkerThread(QThread):
                 # Multiscope: update detection and push snapshot to the tab
                 try:
                     if hasattr(self, "ms") and self.ms:
-                        self.ms.tick(status)                 # feed current user/server state
+                        live_status = {
+                            uid: row
+                            for uid, row in status.items()
+                            if isinstance(row, dict) and row.get("pids")
+                        }
+                        self._sync_multiscope_user_list(
+                            {uid: row.get("pids", ()) for uid, row in live_status.items()}
+                        )
+                        multiscope_status = {
+                            uid: status[uid]
+                            for uid in self._multiscope_synced_user_ids
+                            if uid in status
+                        }
+                        self.ms.tick(multiscope_status)
                         # Handle MultiScope signals (disconnects, etc.)
                         for kind, uid, payload in self.ms.drain_events():
                             if kind == "merchant":
@@ -7306,20 +7683,20 @@ class WorkerThread(QThread):
 
                 # process table signal
                 proc_info = {}
-                for uid, pids in list(self.manager.process_tracker.user_processes.items()):
-                    for pid in list(pids):  # snapshot the list in case it changes
-                        if not self.process_mgr.verify_process_active(pid):
-                            continue
+                for uid, row in status.items():
+                    for pid in list(row.get("pids", ()) if isinstance(row, dict) else ()):
                         created = datetime.fromtimestamp(
                             self.manager.process_tracker.creation_timestamps.get(pid, time.time())
                         ).strftime("%H:%M:%S")
                         proc_info[pid] = {"user_id": uid, "created": created}
-                self.process_signal.emit(proc_info)
+                if proc_info != self._last_process_snapshot:
+                    self._last_process_snapshot = proc_info
+                    self.process_signal.emit(proc_info)
 
 
                 # auto-restart queue (skip donors in handoff)
                 try:
-                    restartables = [
+                    restartables = [] if self._boot_phase else [
                         u for u, s in list(self.user_states.items())
                         if s.get("requires_restart")
                         and not (s["user_info"].get("bad", False) or s["user_info"].get("cap", False))
@@ -7372,10 +7749,6 @@ class WorkerThread(QThread):
 
                     # Only attempt one launch per window; disable relaunches during boot
                     _global_gate = self.initial_delay if self._boot_phase else self.manager.timeouts["launch_delay"]
-
-                    # block the relaunch queue entirely until ramp finishes
-                    if self._boot_phase:
-                        ordered = []
 
                     if ordered and (now - self.timing_trackers['relaunch']) >= _global_gate:
                         launched = False
@@ -8501,11 +8874,17 @@ class UserManagementDialog(QDialog):
         )
 
         header_obj = self.users_table.horizontalHeader()
-        header_obj.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        header_obj.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        header_obj.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header_obj.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        header_obj.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        header_obj.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
         header_obj.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         header_obj.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        self.users_table.setColumnWidth(0, 115)
+        self.users_table.setColumnWidth(1, 165)
+        self.users_table.setColumnWidth(2, 95)
+        self.users_table.setWordWrap(False)
+        self.users_table.verticalHeader().setDefaultSectionSize(34)
+        self.users_table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
         self._manage_users_activity_delegate = _ActivityDotDelegate(self.users_table)
         self.users_table.setItemDelegateForColumn(4, self._manage_users_activity_delegate)
 
@@ -9108,58 +9487,58 @@ class UserManagementDialog(QDialog):
 
         rows.sort(key=_sort_key)
 
-        self.users_table.setRowCount(len(rows))
-        for r, (uid, info) in enumerate(rows):
-            username = str(info.get("username", f"User_{uid}"))
-            psl = str(info.get("private_server_link", "") or "").strip()
-            place = str(info.get("place", "") or "").strip()
-            description = str(info.get("description", "") or "").strip()
-
-            if bool(info.get("alternate_launch", False)):
-                mode = "Alternate"
-                link_preview = psl if psl else (place or "Default")
-            elif psl:
-                mode = "Share" if "roblox.com/share" in psl else "Private"
-                link_preview = psl
-            else:
-                mode = "Public"
-                link_preview = place or "Default"
-
-            if "roblox.com/share" in link_preview and "code=" in link_preview:
-                try:
-                    code = link_preview.split("code=", 1)[1].split("&", 1)[0]
-                    link_preview = f"Share:{code}"
-                except Exception:
-                    pass
-            if len(link_preview) > 64:
-                link_preview = link_preview[:61] + "..."
-            desc_preview = description
-            if len(desc_preview) > 64:
-                desc_preview = desc_preview[:61] + "..."
-
-            uid_item = QTableWidgetItem(uid)
-            uid_item.setData(Qt.ItemDataRole.UserRole, uid)
-            self.users_table.setItem(r, 0, uid_item)
-            self.users_table.setItem(r, 1, QTableWidgetItem(username))
-            self.users_table.setItem(r, 2, QTableWidgetItem(mode))
-
-            link_item = QTableWidgetItem(link_preview)
-            if psl:
-                link_item.setToolTip(psl)
-            self.users_table.setItem(r, 3, link_item)
-            desc_item = QTableWidgetItem(desc_preview)
-            desc_item.setData(_ACTIVITY_TIMESTAMP_ROLE, _coerce_activity_timestamp(info.get("last_launch", 0.0)))
-            activity_tip = _activity_tooltip(info.get("last_launch", 0.0))
-            if description:
-                desc_item.setToolTip(f"{description}\n\n{activity_tip}")
-            else:
-                desc_item.setToolTip(activity_tip)
-            self.users_table.setItem(r, 4, desc_item)
-
+        table = self.users_table
+        table.setUpdatesEnabled(False)
         try:
-            self.users_table.resizeRowsToContents()
-        except Exception:
-            pass
+            table.setRowCount(len(rows))
+            for r, (uid, info) in enumerate(rows):
+                username = str(info.get("username", f"User_{uid}"))
+                psl = str(info.get("private_server_link", "") or "").strip()
+                place = str(info.get("place", "") or "").strip()
+                description = str(info.get("description", "") or "").strip()
+
+                if bool(info.get("alternate_launch", False)):
+                    mode = "Alternate"
+                    link_preview = psl if psl else (place or "Default")
+                elif psl:
+                    mode = "Share" if "roblox.com/share" in psl else "Private"
+                    link_preview = psl
+                else:
+                    mode = "Public"
+                    link_preview = place or "Default"
+
+                if "roblox.com/share" in link_preview and "code=" in link_preview:
+                    try:
+                        code = link_preview.split("code=", 1)[1].split("&", 1)[0]
+                        link_preview = f"Share:{code}"
+                    except Exception:
+                        pass
+                if len(link_preview) > 64:
+                    link_preview = link_preview[:61] + "..."
+                desc_preview = description
+                if len(desc_preview) > 64:
+                    desc_preview = desc_preview[:61] + "..."
+
+                uid_item = QTableWidgetItem(uid)
+                uid_item.setData(Qt.ItemDataRole.UserRole, uid)
+                table.setItem(r, 0, uid_item)
+                table.setItem(r, 1, QTableWidgetItem(username))
+                table.setItem(r, 2, QTableWidgetItem(mode))
+
+                link_item = QTableWidgetItem(link_preview)
+                if psl:
+                    link_item.setToolTip(psl)
+                table.setItem(r, 3, link_item)
+                desc_item = QTableWidgetItem(desc_preview)
+                desc_item.setData(_ACTIVITY_TIMESTAMP_ROLE, _coerce_activity_timestamp(info.get("last_launch", 0.0)))
+                activity_tip = _activity_tooltip(info.get("last_launch", 0.0))
+                if description:
+                    desc_item.setToolTip(f"{description}\n\n{activity_tip}")
+                else:
+                    desc_item.setToolTip(activity_tip)
+                table.setItem(r, 4, desc_item)
+        finally:
+            table.setUpdatesEnabled(True)
 
         self._update_launch_actions()
         self._sync_edit_with_selection()
@@ -10377,56 +10756,286 @@ def pil_to_pixmap(img: Image.Image) -> QPixmap:
     return QPixmap.fromImage(qimg.copy())
 
 
-class _PointPickLabel(QLabel):
-    """QLabel that emits a point when clicked (normalized to pixmap size)."""
-    point_selected = Signal(tuple)
+class _ZoomableScreenshotLabel(QLabel):
+    """Image label that changes display size without losing source coordinates."""
+    zoom_requested = Signal(int, QPoint)
+    MIN_ZOOM_PERCENT = 10
+    MAX_ZOOM_PERCENT = 500
 
     def __init__(self, pixmap: QPixmap, parent=None):
         super().__init__(parent)
-        self.setPixmap(pixmap)
-        self.setFixedSize(pixmap.size())
+        self._source_pixmap = QPixmap(pixmap)
+        self._zoom_percent = 100
+        self.setPixmap(self._source_pixmap)
+        self.setScaledContents(True)
+        self.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self._apply_zoom_size()
+
+    def _apply_zoom_size(self) -> None:
+        width = max(1, round(self._source_pixmap.width() * self._zoom_percent / 100.0))
+        height = max(1, round(self._source_pixmap.height() * self._zoom_percent / 100.0))
+        self.setFixedSize(width, height)
+
+    def set_zoom_percent(self, percent: int) -> None:
+        percent = max(self.MIN_ZOOM_PERCENT, min(self.MAX_ZOOM_PERCENT, int(percent)))
+        if percent == self._zoom_percent:
+            return
+        self._zoom_percent = percent
+        self._apply_zoom_size()
+
+    def zoom_percent(self) -> int:
+        return self._zoom_percent
+
+    def source_size(self) -> QSize:
+        return self._source_pixmap.size()
+
+    def _source_point(self, position: QPointF) -> Tuple[float, float, int, int]:
+        """Map a position on the scaled label to normalized and source pixels."""
+        display_w = max(1, self.width())
+        display_h = max(1, self.height())
+        source_w = max(1, self._source_pixmap.width())
+        source_h = max(1, self._source_pixmap.height())
+
+        display_x = max(0.0, min(float(display_w) - 0.000001, float(position.x())))
+        display_y = max(0.0, min(float(display_h) - 0.000001, float(position.y())))
+        xf = display_x / float(display_w)
+        yf = display_y / float(display_h)
+        source_x = max(0, min(source_w - 1, int(xf * source_w)))
+        source_y = max(0, min(source_h - 1, int(yf * source_h)))
+        return xf, yf, source_x, source_y
+
+    def wheelEvent(self, event):
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            delta = int(event.angleDelta().y())
+            if delta:
+                self.zoom_requested.emit(
+                    1 if delta > 0 else -1,
+                    event.globalPosition().toPoint(),
+                )
+                event.accept()
+                return
+        super().wheelEvent(event)
+
+
+class _PointPickLabel(_ZoomableScreenshotLabel):
+    """Zoomable screenshot label that emits a source-image point."""
+    point_selected = Signal(tuple)
+
+    def __init__(self, pixmap: QPixmap, parent=None):
+        super().__init__(pixmap, parent)
         self.setCursor(Qt.CursorShape.CrossCursor)
 
     def mousePressEvent(self, event):
-        pm = self.pixmap()
-        if not pm:
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mousePressEvent(event)
             return
-        w = pm.width()
-        h = pm.height()
-        if w <= 0 or h <= 0:
-            return
-
-        pt = event.position().toPoint()
-        x = max(0, min(w - 1, pt.x()))
-        y = max(0, min(h - 1, pt.y()))
-        self.point_selected.emit((x / w, y / h, x, y))
+        self.point_selected.emit(self._source_point(event.position()))
 
 
-class PointPickDialog(QDialog):
-    """Modal dialog that lets the user pick a single point on a screenshot."""
+class _ScreenshotScrollArea(QScrollArea):
+    """Scroll area that also supports Ctrl+wheel zoom over image margins."""
+    zoom_requested = Signal(int, QPoint)
 
-    def __init__(self, pixmap: QPixmap, title: str, parent=None):
+    def wheelEvent(self, event):
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            delta = int(event.angleDelta().y())
+            if delta:
+                self.zoom_requested.emit(
+                    1 if delta > 0 else -1,
+                    event.globalPosition().toPoint(),
+                )
+                event.accept()
+                return
+        super().wheelEvent(event)
+
+
+class _ScreenshotSelectorDialog(QDialog):
+    """Common zoom controls and scrolling for screenshot selectors."""
+    ZOOM_STEP = 25
+
+    def __init__(
+        self,
+        pixmap: QPixmap,
+        title: str,
+        hint: str,
+        label_type,
+        parent=None,
+    ):
         super().__init__(parent)
         self.setWindowTitle(title)
-        self._point: Optional[Tuple[float, float, int, int]] = None
+        self._pending_zoom_anchor: Optional[QPoint] = None
 
         layout = QVBoxLayout(self)
+        hint_label = QLabel(hint)
+        hint_label.setWordWrap(True)
+        hint_label.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY};")
+        layout.addWidget(hint_label)
 
-        hint = QLabel("Click on the screenshot to select the coordinate.")
-        hint.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY};")
-        layout.addWidget(hint)
+        zoom_row = QHBoxLayout()
+        zoom_row.setSpacing(6)
+        zoom_title = QLabel("Zoom:")
+        zoom_row.addWidget(zoom_title)
 
-        self._label = _PointPickLabel(pixmap, self)
-        self._label.point_selected.connect(self._on_point_selected)
+        self._zoom_out_button = QPushButton("-")
+        self._zoom_out_button.setToolTip("Zoom out")
+        self._zoom_out_button.setFixedWidth(34)
+        zoom_row.addWidget(self._zoom_out_button)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(self._label)
-        layout.addWidget(scroll)
+        self._zoom_slider = QSlider(Qt.Orientation.Horizontal)
+        self._zoom_slider.setRange(
+            _ZoomableScreenshotLabel.MIN_ZOOM_PERCENT,
+            _ZoomableScreenshotLabel.MAX_ZOOM_PERCENT,
+        )
+        self._zoom_slider.setSingleStep(5)
+        self._zoom_slider.setPageStep(self.ZOOM_STEP)
+        self._zoom_slider.setValue(100)
+        self._zoom_slider.setToolTip("Zoom the screenshot from 10% to 500%")
+        zoom_row.addWidget(self._zoom_slider, 1)
+
+        self._zoom_value_label = QLabel("100%")
+        self._zoom_value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._zoom_value_label.setMinimumWidth(48)
+        zoom_row.addWidget(self._zoom_value_label)
+
+        self._zoom_in_button = QPushButton("+")
+        self._zoom_in_button.setToolTip("Zoom in")
+        self._zoom_in_button.setFixedWidth(34)
+        zoom_row.addWidget(self._zoom_in_button)
+
+        self._zoom_reset_button = QPushButton("100%")
+        self._zoom_reset_button.setToolTip("Reset to actual size")
+        zoom_row.addWidget(self._zoom_reset_button)
+
+        self._zoom_fit_button = QPushButton("Fit")
+        self._zoom_fit_button.setToolTip("Fit the whole screenshot in the window")
+        zoom_row.addWidget(self._zoom_fit_button)
+        layout.addLayout(zoom_row)
+
+        zoom_help = QLabel("Ctrl+mouse wheel zooms toward the cursor. Use the scroll bars to pan while zoomed in.")
+        zoom_help.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY};")
+        layout.addWidget(zoom_help)
+
+        self._label = label_type(pixmap, self)
+        self._label.zoom_requested.connect(self._zoom_by_steps)
+
+        self._scroll = _ScreenshotScrollArea()
+        self._scroll.zoom_requested.connect(self._zoom_by_steps)
+        self._scroll.setWidgetResizable(False)
+        self._scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._scroll.setWidget(self._label)
+        layout.addWidget(self._scroll, 1)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+        self._zoom_slider.valueChanged.connect(self._apply_zoom)
+        self._zoom_out_button.clicked.connect(lambda: self._zoom_by_steps(-1))
+        self._zoom_in_button.clicked.connect(lambda: self._zoom_by_steps(1))
+        self._zoom_reset_button.clicked.connect(lambda: self._zoom_slider.setValue(100))
+        self._zoom_fit_button.clicked.connect(self._fit_screenshot)
+
+        try:
+            self.resize(
+                min(max(pixmap.width() + 40, 520), 980),
+                min(max(pixmap.height() + 180, 420), 760),
+            )
+        except Exception:
+            pass
+
+    def _zoom_by_steps(self, steps: int, anchor_global: Optional[QPoint] = None) -> None:
+        direction = 1 if int(steps) > 0 else -1
+        current = int(self._zoom_slider.value())
+        target = max(
+            self._zoom_slider.minimum(),
+            min(self._zoom_slider.maximum(), current + (direction * self.ZOOM_STEP)),
+        )
+        if target == current:
+            self._pending_zoom_anchor = None
+            return
+        self._pending_zoom_anchor = QPoint(anchor_global) if anchor_global is not None else None
+        self._zoom_slider.setValue(target)
+
+    def _apply_zoom(self, percent: int) -> None:
+        old_width = max(1, self._label.width())
+        old_height = max(1, self._label.height())
+        viewport = self._scroll.viewport()
+        h_bar = self._scroll.horizontalScrollBar()
+        v_bar = self._scroll.verticalScrollBar()
+        anchor_global = self._pending_zoom_anchor
+        self._pending_zoom_anchor = None
+
+        anchor_viewport: Optional[QPoint] = None
+        if anchor_global is not None:
+            anchor_label = self._label.mapFromGlobal(anchor_global)
+            anchor_viewport = viewport.mapFromGlobal(anchor_global)
+            anchor_x = max(0.0, min(1.0, anchor_label.x() / float(old_width)))
+            anchor_y = max(0.0, min(1.0, anchor_label.y() / float(old_height)))
+        else:
+            anchor_x = (
+                (h_bar.value() + (viewport.width() / 2.0)) / float(old_width)
+                if old_width > viewport.width()
+                else 0.5
+            )
+            anchor_y = (
+                (v_bar.value() + (viewport.height() / 2.0)) / float(old_height)
+                if old_height > viewport.height()
+                else 0.5
+            )
+
+        percent = int(percent)
+        self._zoom_value_label.setText(f"{percent}%")
+        self._label.set_zoom_percent(percent)
+
+        def _restore_anchor() -> None:
+            if int(self._zoom_slider.value()) != percent:
+                return
+            if anchor_viewport is None:
+                h_bar.setValue(round((anchor_x * self._label.width()) - (viewport.width() / 2.0)))
+                v_bar.setValue(round((anchor_y * self._label.height()) - (viewport.height() / 2.0)))
+                return
+
+            label_origin = self._label.mapTo(viewport, QPoint(0, 0))
+            anchored_x = label_origin.x() + (anchor_x * self._label.width())
+            anchored_y = label_origin.y() + (anchor_y * self._label.height())
+            h_bar.setValue(h_bar.value() + round(anchored_x - anchor_viewport.x()))
+            v_bar.setValue(v_bar.value() + round(anchored_y - anchor_viewport.y()))
+
+        # Resize events normally update the scroll ranges synchronously. Restore
+        # now for rapid wheel input, then once more after layout as a safeguard.
+        _restore_anchor()
+        QTimer.singleShot(0, _restore_anchor)
+
+    def _fit_screenshot(self) -> None:
+        source_size = self._label.source_size()
+        if source_size.width() <= 0 or source_size.height() <= 0:
+            return
+        viewport_size = self._scroll.viewport().size()
+        width_ratio = max(1, viewport_size.width() - 4) / float(source_size.width())
+        height_ratio = max(1, viewport_size.height() - 4) / float(source_size.height())
+        fit_percent = round(min(width_ratio, height_ratio) * 100.0)
+        self._zoom_slider.setValue(
+            max(
+                _ZoomableScreenshotLabel.MIN_ZOOM_PERCENT,
+                min(_ZoomableScreenshotLabel.MAX_ZOOM_PERCENT, fit_percent),
+            )
+        )
+
+
+class PointPickDialog(_ScreenshotSelectorDialog):
+    """Modal dialog that lets the user pick a single point on a screenshot."""
+
+    def __init__(self, pixmap: QPixmap, title: str, parent=None):
+        self._point: Optional[Tuple[float, float, int, int]] = None
+        super().__init__(
+            pixmap,
+            title,
+            "Click on the screenshot to select the coordinate.",
+            _PointPickLabel,
+            parent,
+        )
+        self._label.point_selected.connect(self._on_point_selected)
 
     def _on_point_selected(self, point: tuple):
         try:
@@ -10441,82 +11050,67 @@ class PointPickDialog(QDialog):
         return self._point
 
 
-class _SelectableLabel(QLabel):
-    """QLabel that exposes a drag-to-select ROI signal."""
+class _SelectableLabel(_ZoomableScreenshotLabel):
+    """Zoomable screenshot label that exposes a drag-to-select ROI signal."""
     roi_selected = Signal(tuple)
 
     def __init__(self, pixmap: QPixmap, parent=None):
-        super().__init__(parent)
-        self.setPixmap(pixmap)
-        self.setFixedSize(pixmap.size())
+        super().__init__(pixmap, parent)
+        self.setCursor(Qt.CursorShape.CrossCursor)
         self._rubber = QRubberBand(QRubberBand.Shape.Rectangle, self)
-        self._origin: Optional[QPoint] = None
+        self._origin: Optional[QPointF] = None
+
+    def set_zoom_percent(self, percent: int) -> None:
+        self._origin = None
+        self._rubber.hide()
+        self._rubber.setGeometry(QRect())
+        super().set_zoom_percent(percent)
 
     def mousePressEvent(self, event):
-        self._origin = event.position().toPoint()
-        self._rubber.setGeometry(QRect(self._origin, QSize()))
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mousePressEvent(event)
+            return
+        self._origin = event.position()
+        self._rubber.setGeometry(QRect(self._origin.toPoint(), QSize()))
         self._rubber.show()
 
     def mouseMoveEvent(self, event):
         if self._origin is None:
             return
         current = event.position().toPoint()
-        rect = QRect(self._origin, current).normalized()
+        rect = QRect(self._origin.toPoint(), current).normalized()
         self._rubber.setGeometry(rect)
 
     def mouseReleaseEvent(self, event):
         if self._origin is None:
             return
-        current = event.position().toPoint()
-        rect = QRect(self._origin, current).normalized()
+        current = event.position()
+        origin = self._origin
         self._rubber.hide()
         self._rubber.setGeometry(QRect())
 
-        origin = self._origin
         self._origin = None
-        if rect.width() < 2 or rect.height() < 2:
+        left = max(0.0, min(float(self.width()), min(origin.x(), current.x())))
+        top = max(0.0, min(float(self.height()), min(origin.y(), current.y())))
+        right = max(0.0, min(float(self.width()), max(origin.x(), current.x())))
+        bottom = max(0.0, min(float(self.height()), max(origin.y(), current.y())))
+        selection_width = right - left
+        selection_height = bottom - top
+        if selection_width < 2.0 or selection_height < 2.0:
             return
 
-        pm = self.pixmap()
-        if not pm:
-            return
-        w = pm.width()
-        h = pm.height()
-        if w <= 0 or h <= 0:
-            return
-
-        roi = (rect.x() / w, rect.y() / h, rect.width() / w, rect.height() / h)
+        w = max(1, self.width())
+        h = max(1, self.height())
+        roi = (left / w, top / h, selection_width / w, selection_height / h)
         self.roi_selected.emit(roi)
 
 
-class ROICropDialog(QDialog):
+class ROICropDialog(_ScreenshotSelectorDialog):
     """Modal dialog that lets the user pick a chat ROI."""
     def __init__(self, pixmap: QPixmap, parent=None, *, title: str = "Select Chat Area", hint: str = "Drag to draw the chat box. Release to save."):
-        super().__init__(parent)
-        self.setWindowTitle(title)
         self._roi: Optional[Tuple[float, float, float, float]] = None
-
-        layout = QVBoxLayout(self)
-        hint_lbl = QLabel(hint)
-        hint_lbl.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY};")
-        layout.addWidget(hint_lbl)
-
-        label = _SelectableLabel(pixmap, self)
-        label.roi_selected.connect(self._on_roi_selected)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(label)
-        layout.addWidget(scroll)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-        try:
-            self.resize(min(max(pixmap.width() + 40, 520), 980), min(max(pixmap.height() + 120, 360), 760))
-        except Exception:
-            pass
+        super().__init__(pixmap, title, hint, _SelectableLabel, parent)
+        self._label.roi_selected.connect(self._on_roi_selected)
 
     def _on_roi_selected(self, roi: Tuple[float, float, float, float]):
         self._roi = roi
@@ -10616,6 +11210,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
     discord_control_log_signal = Signal(str)
     discord_control_state_signal = Signal(str, str)
     roblox_log_cleanup_result_signal = Signal(object)
+    merchant_fix_result_signal = Signal(str, bool, str)
+    merchant_fix_handoff_signal = Signal(int)
 
     def __init__(self):
         super().__init__()
@@ -10645,6 +11241,11 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.settings_tab_index: Optional[int] = None
         self.dashboard_tab_index: Optional[int] = None
         self.users_tab_index: Optional[int] = None
+        self.logs_tab_index: Optional[int] = None
+        self.ocr_tab_index: Optional[int] = None
+        self.antiafk_tab_index: Optional[int] = None
+        self.auto_item_tab_index: Optional[int] = None
+        self.bes_tab_index: Optional[int] = None
         self.multiscope_tab_index: Optional[int] = None
         self._ram_export_dialog: Optional[QDialog] = None
         self._utilities_dialog: Optional[QDialog] = None
@@ -10660,6 +11261,29 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self._roblox_log_cleanup_in_progress: bool = False
         self._roblox_log_cleanup_last_result: Optional[RobloxLogCleanupResult] = None
         self._roblox_log_cleanup_config: dict = dict(ROBLOX_LOG_CLEANUP_DEFAULT_CONFIG)
+        self._merchant_fix_dialog: Optional[QDialog] = None
+        self._merchant_fix_mode_combo: Optional[QComboBox] = None
+        self._merchant_fix_stack: Optional[QStackedWidget] = None
+        self._merchant_fix_status_label: Optional[QLabel] = None
+        self._merchant_fix_header_state_label: Optional[QLabel] = None
+        self._merchant_fix_trigger_combo: Optional[QComboBox] = None
+        self._merchant_fix_displayed_trigger = SMART_BLOCK_TRIGGER_BOSS_RAID_UI
+        self._merchant_fix_delay_spin: Optional[QDoubleSpinBox] = None
+        self._merchant_fix_users_button: Optional[QPushButton] = None
+        self._merchant_fix_users_summary_label: Optional[QLabel] = None
+        self._merchant_fix_blocks_table: Optional[QTableWidget] = None
+        self._merchant_fix_blocks_summary_label: Optional[QLabel] = None
+        self._merchant_fix_blocks_signature: tuple = ()
+        self._merchant_fix_roll_button: Optional[QPushButton] = None
+        self._merchant_fix_classic_start_button: Optional[QPushButton] = None
+        self._merchant_fix_classic_disable_button: Optional[QPushButton] = None
+        self._merchant_fix_smart_enable_button: Optional[QPushButton] = None
+        self._merchant_fix_smart_disable_button: Optional[QPushButton] = None
+        self._merchant_fix_log_box: Optional[QTextEdit] = None
+        self._merchant_fix_refresh_timer: Optional[QTimer] = None
+        self._merchant_fix_pending: bool = False
+        self._merchant_fix_pending_operation: str = ""
+        self._merchant_fix_roll_ready: bool = False
         self._multi_instance_dialog: Optional[QDialog] = None
         self._multi_instance_checkbox: Optional[QCheckBox] = None
         self._multi_instance_status_label: Optional[QLabel] = None
@@ -10693,22 +11317,44 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self._users_table_dirty: bool = False
         self._users_table_refresh_pending: bool = False
         self._users_table_force_full: bool = False
+        self._users_table_dirty_uids: Set[str] = set()
+        self._users_table_config_signature: Optional[bytes] = None
+        self._dashboard_runtime_summary: Tuple[int, int, int] = (0, 0, 0)
+        self._dashboard_good_count_signature: Optional[bytes] = None
+        self._dashboard_good_count: int = 0
         self._accounts_list_users_mtime: float = -1.0
+        self._accounts_list_order: List[str] = []
+        self._accounts_list_row_signatures: Dict[str, tuple] = {}
+        self._accounts_list_catalog_signature: Optional[tuple] = None
+        self._visible_table_actions_pending: bool = False
+        self._users_action_widget_cells: Set[Tuple[int, int]] = set()
+        self._accounts_action_widget_cells: Set[Tuple[int, int]] = set()
 
         self._multiscope_table_dirty: bool = False
         self._multiscope_table_refresh_pending: bool = False
         self._multiscope_table_latest_rows: Optional[list] = None
 
-        self._log_queue = deque()
+        self._log_queue = deque(maxlen=10_000)
         self._activity_recent = deque(maxlen=10)
         self._log_flush_timer: Optional[QTimer] = None
-        self._ocr_log_queue = deque()
-        self._antiafk_log_queue = deque()
-        self._autoitem_log_queue = deque()
-        self._bes_log_queue = deque()
+        # Hidden QTextEdit documents are surprisingly expensive to lay out.
+        # Keep bounded pending queues and render each feature log only while its
+        # tab is visible.
+        self._ocr_log_queue = deque(maxlen=5_000)
+        self._antiafk_log_queue = deque(maxlen=5_000)
+        self._autoitem_log_queue = deque(maxlen=5_000)
+        self._bes_log_queue = deque(maxlen=5_000)
         self._discord_control_action_queue: "queue.Queue[dict]" = queue.Queue()
         self._discord_control_log_lines: deque[str] = deque(maxlen=250)
         self.config_manager = ConfigManager()
+        self.merchant_fix_controller = get_merchant_fix_controller()
+        try:
+            self.merchant_fix_controller.load_settings(self.config_manager.peek_settings() or {})
+            self.merchant_fix_controller.set_late_handoff_callback(
+                self.merchant_fix_handoff_signal.emit
+            )
+        except Exception:
+            pass
         self.cookie_extractor = CookieExtractor(self)
         self.skip_account_private_link_warning = False
         self.skip_account_public_place_warning = False
@@ -10796,6 +11442,14 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self._antiafk_last_touch_by_uid: Dict[str, float] = {}
         self._antiafk_last_action_by_uid: Dict[str, float] = {}
         self._antiafk_pid_to_uid: Dict[int, str] = {}
+        # Keep a short per-PID ledger even after a touch resolves. A resumed
+        # process tracker can correct ownership after initially restoring the
+        # old snapshot, and the successful touch must follow that correction.
+        self._antiafk_last_touch_by_pid: Dict[int, float] = {}
+        # A successful native action can arrive before the manager's next PID
+        # ownership snapshot. Keep those events until ownership catches up so
+        # the per-user overdue clock is not left stale.
+        self._antiafk_pending_touch_by_pid: Dict[int, float] = {}
         self._antiafk_disconnected_pids: Set[int] = set()
         self._antiafk_auto_action_overdue_min: float = _ANTIAFK_AUTO_ACTION_OVERDUE_MIN_DEFAULT
 
@@ -10877,6 +11531,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.discord_control_log_signal.connect(self._on_discord_control_log)
         self.discord_control_state_signal.connect(self._on_discord_control_state_changed)
         self.roblox_log_cleanup_result_signal.connect(self._on_roblox_log_cleanup_finished)
+        self.merchant_fix_result_signal.connect(self._on_merchant_fix_operation_finished)
+        self.merchant_fix_handoff_signal.connect(self._on_late_merchant_fix_handoff)
 
         self.setup_ui()
         try:
@@ -10913,6 +11569,16 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         try:
             if event is not None:
                 et = event.type()
+
+                if et in (QEvent.Type.Resize, QEvent.Type.Show, QEvent.Type.Hide):
+                    for table_name in ("users_table", "accounts_list"):
+                        table = getattr(self, table_name, None)
+                        try:
+                            if table is not None and (obj is table or obj is table.viewport()):
+                                self._schedule_visible_table_action_widgets()
+                                break
+                        except Exception:
+                            continue
 
                 def _wheel_target(w):
                     if isinstance(w, (QAbstractSpinBox, QComboBox, QSlider)):
@@ -11129,6 +11795,10 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         multi_instance_action.setToolTip("Allow multiple Roblox Player instances to run at the same time")
         multi_instance_action.triggered.connect(self.show_multi_instance_window)
 
+        merchant_fix_action = extras_menu.addAction("Merchant Fix")
+        merchant_fix_action.setToolTip("Create asset-delivery errors used by log-based merchant detection")
+        merchant_fix_action.triggered.connect(self.show_merchant_fix_window)
+
         ram_export_action = extras_menu.addAction("RAM Export")
         ram_export_action.triggered.connect(self.show_ram_export_window)
 
@@ -11160,6 +11830,1113 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         except Exception:
             show_tutorial = False
         self._apply_tutorial_menu_visibility(show_tutorial)
+
+    def _position_merchant_fix_dialog(
+        self, dialog: QDialog, *, initial: bool = False
+    ) -> None:
+        """Keep Merchant Fix fully inside the parent monitor's work area."""
+        screen = None
+        try:
+            screen = QApplication.screenAt(self.frameGeometry().center())
+        except Exception:
+            screen = None
+        if screen is None:
+            try:
+                screen = self.screen()
+            except Exception:
+                screen = None
+        if screen is None:
+            try:
+                screen = QApplication.primaryScreen()
+            except Exception:
+                screen = None
+        if screen is None:
+            return
+
+        available = screen.availableGeometry()
+        max_width = max(1, available.width() - 32)
+        max_height = max(1, available.height() - 48)
+        if initial:
+            target_width = min(840, max_width)
+            target_height = min(840, max_height)
+            dialog.setMinimumSize(
+                min(720, target_width),
+                min(620, target_height),
+            )
+            dialog.resize(target_width, target_height)
+        elif dialog.width() > max_width or dialog.height() > max_height:
+            dialog.setMinimumSize(
+                min(dialog.minimumWidth(), max_width),
+                min(dialog.minimumHeight(), max_height),
+            )
+            dialog.resize(
+                min(dialog.width(), max_width),
+                min(dialog.height(), max_height),
+            )
+
+        width = dialog.frameGeometry().width() if dialog.isVisible() else dialog.width()
+        height = dialog.frameGeometry().height() if dialog.isVisible() else dialog.height()
+        if initial:
+            x = available.left() + (available.width() - width) // 2
+            y = available.top() + (available.height() - height) // 2
+        else:
+            frame = dialog.frameGeometry()
+            x = frame.left()
+            y = frame.top()
+        x = max(available.left(), min(x, available.right() - width + 1))
+        y = max(available.top(), min(y, available.bottom() - height + 1))
+        dialog.move(x, y)
+
+    def show_merchant_fix_window(self) -> None:
+        dialog = getattr(self, "_merchant_fix_dialog", None)
+        if dialog is not None:
+            self._refresh_merchant_fix_dialog()
+            timer = getattr(self, "_merchant_fix_refresh_timer", None)
+            if timer is not None:
+                timer.start()
+            self._position_merchant_fix_dialog(dialog)
+            dialog.show()
+            QTimer.singleShot(
+                0, lambda current=dialog: self._position_merchant_fix_dialog(current)
+            )
+            dialog.raise_()
+            dialog.activateWindow()
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Merchant Fix")
+        dialog.setModal(False)
+        dialog.setMinimumSize(720, 620)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(10)
+
+        header = QHBoxLayout()
+        header_text = QVBoxLayout()
+        header_text.setSpacing(2)
+        title = QLabel("Merchant Fix")
+        title_font = QFont()
+        title_font.setPointSize(18)
+        title_font.setBold(True)
+        title.setFont(title_font)
+        header_text.addWidget(title)
+
+        description = QLabel(
+            "Control how assetdelivery.roblox.com is blocked for merchant detection."
+        )
+        description.setWordWrap(True)
+        description.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY};")
+        header_text.addWidget(description)
+        header.addLayout(header_text, 1)
+        header_state = QLabel()
+        header_state.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        header_state.setMinimumWidth(118)
+        header_state.setContentsMargins(12, 7, 12, 7)
+        self._merchant_fix_header_state_label = header_state
+        header.addWidget(header_state, 0, Qt.AlignmentFlag.AlignTop)
+        layout.addLayout(header)
+
+        mode_group = QGroupBox("Block mode")
+        mode_layout = QVBoxLayout(mode_group)
+        mode_layout.setSpacing(6)
+        mode_row = QHBoxLayout()
+        mode_help = QLabel("Choose how Merchant Fix blocks assets.")
+        mode_help.setWordWrap(True)
+        mode_help.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY};")
+        mode_row.addWidget(mode_help, 1)
+        mode_row.addWidget(QLabel("Configure:"))
+        mode_combo = QComboBox()
+        mode_combo.addItems(["Classic", "Smart"])
+        mode_combo.setMinimumWidth(140)
+        mode_row.addWidget(mode_combo)
+        mode_layout.addLayout(mode_row)
+        mode_details = QLabel()
+        mode_details.setWordWrap(True)
+        mode_layout.addWidget(mode_details)
+        layout.addWidget(mode_group)
+        self._merchant_fix_mode_combo = mode_combo
+
+        classic_mode_description = (
+            "<b>1. Prepare</b> — close Roblox and clear rbx-storage plus its database files.<br>"
+            "<b>2. Choose</b> — optionally load Sols RNG to the Play button for Roll Fix.<br>"
+            "<b>3. Block</b> — apply the asset block to the whole PC."
+        )
+        smart_mode_description = (
+            "Smart Mode applies an asset block only to processes managed by the program."
+        )
+
+        stack = QStackedWidget()
+        self._merchant_fix_stack = stack
+
+        classic_page = QWidget()
+        classic_layout = QVBoxLayout(classic_page)
+        classic_layout.setContentsMargins(2, 4, 2, 4)
+        classic_layout.setSpacing(10)
+        storage_label = QLabel(f"Storage location  •  {get_roblox_storage_dir()}")
+        storage_label.setWordWrap(True)
+        storage_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        storage_label.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY};")
+        classic_layout.addWidget(storage_label)
+
+        classic_buttons = QHBoxLayout()
+        classic_start = QPushButton("Prepare Classic Fix")
+        classic_start.setProperty("class", "warning")
+        classic_start.clicked.connect(self._start_merchant_fix_classic)
+        classic_buttons.addWidget(classic_start)
+        self._merchant_fix_classic_start_button = classic_start
+
+        classic_disable = QPushButton("Disable Classic Block")
+        classic_disable.clicked.connect(self._disable_merchant_fix_classic)
+        classic_buttons.addWidget(classic_disable)
+        self._merchant_fix_classic_disable_button = classic_disable
+        classic_buttons.addStretch()
+        classic_layout.addLayout(classic_buttons)
+
+        roll_button = QPushButton("Reached the Play Button — Apply Roll Fix")
+        roll_button.setProperty("class", "danger")
+        roll_button.setToolTip("Available after Classic preparation when Roll Fix is selected.")
+        roll_button.clicked.connect(self._apply_merchant_fix_roll)
+        classic_layout.addWidget(roll_button)
+        self._merchant_fix_roll_button = roll_button
+        stack.addWidget(classic_page)
+
+        smart_page = QWidget()
+        smart_layout = QVBoxLayout(smart_page)
+        smart_layout.setContentsMargins(2, 2, 2, 2)
+        smart_layout.setSpacing(6)
+
+        users_group = QGroupBox("User coverage")
+        users_group.setToolTip(
+            "Coverage changes affect future launches. Existing and in-progress Smart blocks are preserved."
+        )
+        users_layout = QHBoxLayout(users_group)
+        users_layout.setContentsMargins(12, 8, 12, 8)
+        users_layout.setSpacing(8)
+        users_summary = QLabel()
+        users_summary.setWordWrap(False)
+        users_summary.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY};")
+        users_layout.addWidget(users_summary, 1)
+        users_button = QPushButton("Select Users…")
+        users_button.clicked.connect(self._open_merchant_fix_user_selector)
+        users_layout.addWidget(users_button)
+        self._merchant_fix_users_button = users_button
+        self._merchant_fix_users_summary_label = users_summary
+        smart_layout.addWidget(users_group)
+
+        delay_group = QGroupBox("Asset block timing")
+        delay_layout = QHBoxLayout(delay_group)
+        delay_layout.setContentsMargins(12, 8, 12, 8)
+        delay_layout.setSpacing(8)
+        delay_layout.addWidget(QLabel("Trigger:"))
+        trigger_combo = QComboBox()
+        trigger_combo.addItem(
+            "BossRaidUI marker", SMART_BLOCK_TRIGGER_BOSS_RAID_UI
+        )
+        trigger_combo.addItem("Exit main menu", SMART_BLOCK_TRIGGER_MENU_EXIT)
+        trigger_index = trigger_combo.findData(
+            self.merchant_fix_controller.smart_block_trigger
+        )
+        trigger_combo.setCurrentIndex(max(0, trigger_index))
+        self._merchant_fix_displayed_trigger = str(trigger_combo.currentData())
+        trigger_combo.setMinimumWidth(165)
+        trigger_combo.setToolTip(
+            "Choose the Roblox log event that starts the configurable delay. "
+            "Exit main menu waits for a Main Menu to non-menu RPC transition."
+        )
+        trigger_combo.currentIndexChanged.connect(
+            self._save_merchant_fix_trigger_setting
+        )
+        delay_layout.addWidget(trigger_combo, 1)
+        self._merchant_fix_trigger_combo = trigger_combo
+        delay_layout.addWidget(QLabel("Delay:"))
+        delay_spin = QDoubleSpinBox()
+        delay_spin.setRange(0.0, 60.0)
+        delay_spin.setDecimals(2)
+        delay_spin.setSingleStep(0.25)
+        delay_spin.setSuffix(" s")
+        delay_spin.setMinimumWidth(105)
+        delay_spin.setValue(
+            self.merchant_fix_controller.smart_block_delay_seconds(
+                self._merchant_fix_displayed_trigger
+            )
+        )
+        delay_spin.setToolTip(
+            "Wait this long after the selected trigger. "
+            "0 applies the PID block immediately; maximum 60 seconds."
+        )
+        delay_spin.editingFinished.connect(self._save_merchant_fix_delay_setting)
+        delay_layout.addWidget(delay_spin)
+        self._merchant_fix_delay_spin = delay_spin
+        smart_layout.addWidget(delay_group)
+
+        smart_buttons = QHBoxLayout()
+        smart_enable = QPushButton("Enable Smart Mode")
+        smart_enable.setProperty("class", "success")
+        smart_enable.clicked.connect(self._enable_merchant_fix_smart)
+        smart_buttons.addWidget(smart_enable)
+        self._merchant_fix_smart_enable_button = smart_enable
+        smart_disable = QPushButton("Disable Smart Mode")
+        smart_disable.clicked.connect(self._disable_merchant_fix_smart)
+        smart_buttons.addWidget(smart_disable)
+        self._merchant_fix_smart_disable_button = smart_disable
+        smart_buttons.addStretch()
+        smart_layout.addLayout(smart_buttons)
+        stack.addWidget(smart_page)
+
+        def _show_mode(index: int) -> None:
+            stack.setCurrentIndex(index)
+            mode_details.setText(
+                smart_mode_description if index == 1 else classic_mode_description
+            )
+            page = stack.widget(index)
+            if page is not None:
+                stack.setFixedHeight(max(1, page.minimumSizeHint().height()))
+
+        mode_combo.currentIndexChanged.connect(_show_mode)
+        initial_mode = (
+            1 if self.merchant_fix_controller.smart_enabled and not is_classic_block_active() else 0
+        )
+        mode_combo.setCurrentIndex(initial_mode)
+        _show_mode(initial_mode)
+        layout.addWidget(stack)
+
+        status_group = QGroupBox("Status")
+        status_layout = QHBoxLayout(status_group)
+        status_label = QLabel()
+        status_label.setWordWrap(True)
+        status_layout.addWidget(status_label, 1)
+        self._merchant_fix_status_label = status_label
+        layout.addWidget(status_group)
+
+        details_tabs = QTabWidget()
+        blocks_tab = QWidget()
+        blocks_layout = QVBoxLayout(blocks_tab)
+        blocks_layout.setContentsMargins(10, 10, 10, 10)
+        blocks_summary = QLabel()
+        blocks_summary.setStyleSheet("font-weight:600;")
+        blocks_layout.addWidget(blocks_summary)
+        self._merchant_fix_blocks_summary_label = blocks_summary
+
+        blocks_table = QTableWidget(0, 5)
+        blocks_table.setObjectName("merchantFixBlocksTable")
+        blocks_table.setHorizontalHeaderLabels(
+            ["Mode", "Username", "Target", "Blocked domain", "Status"]
+        )
+        blocks_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        blocks_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        blocks_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        blocks_table.setAlternatingRowColors(True)
+        blocks_table.verticalHeader().setVisible(False)
+        # Let short work areas reclaim some vertical space while the stretch
+        # layout still gives the table the extra room on normal displays.
+        blocks_table.setMinimumHeight(120)
+        blocks_table.setStyleSheet(
+            f"""
+            QTableWidget#merchantFixBlocksTable {{
+                background-color: {ModernStyle.SURFACE};
+                alternate-background-color: {ModernStyle.SURFACE_VARIANT};
+                color: {ModernStyle.TEXT_PRIMARY};
+                gridline-color: {ModernStyle.BORDER};
+                border: 1px solid {ModernStyle.BORDER};
+            }}
+            QTableWidget#merchantFixBlocksTable::item {{
+                padding: 6px;
+            }}
+            QTableWidget#merchantFixBlocksTable QHeaderView::section {{
+                background-color: {ModernStyle.BACKGROUND};
+                color: {ModernStyle.TEXT_PRIMARY};
+                border: 1px solid {ModernStyle.BORDER};
+                padding: 6px;
+            }}
+            QTableWidget#merchantFixBlocksTable::item:selected {{
+                background-color: {ModernStyle.PRIMARY};
+                color: {ModernStyle.TEXT_PRIMARY};
+            }}
+            """
+        )
+        block_header = blocks_table.horizontalHeader()
+        block_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        block_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        block_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        block_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        block_header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        blocks_layout.addWidget(blocks_table)
+        self._merchant_fix_blocks_table = blocks_table
+        details_tabs.addTab(blocks_tab, "Current blocks")
+
+        log_tab = QWidget()
+        log_layout = QVBoxLayout(log_tab)
+        log_layout.setContentsMargins(10, 10, 10, 10)
+        log_box = QTextEdit()
+        log_box.setReadOnly(True)
+        log_box.setMinimumHeight(120)
+        log_layout.addWidget(log_box)
+        log_path_label = QLabel(str(get_merchant_fix_log_path()))
+        log_path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        log_path_label.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY};")
+        log_layout.addWidget(log_path_label)
+        self._merchant_fix_log_box = log_box
+        details_tabs.addTab(log_tab, "Activity log")
+        layout.addWidget(details_tabs, 1)
+
+        close_row = QHBoxLayout()
+        close_row.addStretch()
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(dialog.close)
+        close_row.addWidget(close_button)
+        layout.addLayout(close_row)
+
+        timer = QTimer(dialog)
+        timer.setInterval(1000)
+        timer.timeout.connect(self._refresh_merchant_fix_dialog)
+        timer.start()
+        dialog.finished.connect(timer.stop)
+        self._merchant_fix_refresh_timer = timer
+        self._merchant_fix_dialog = dialog
+        self._merchant_fix_blocks_signature = ()
+        self._refresh_merchant_fix_dialog()
+        try:
+            layout.activate()
+        except Exception:
+            pass
+        self._position_merchant_fix_dialog(dialog, initial=True)
+        dialog.show()
+        QTimer.singleShot(0, lambda: _show_mode(mode_combo.currentIndex()))
+        QTimer.singleShot(
+            0, lambda current=dialog: self._position_merchant_fix_dialog(current)
+        )
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _merchant_fix_manager_active(self) -> bool:
+        return bool(
+            (self.worker_thread and self.worker_thread.isRunning())
+            or getattr(self, "_manager_paused", False)
+        )
+
+    def _merchant_fix_username_for_pid(self, pid: int) -> str:
+        """Resolve a Smart block PID to its configured Roblox username."""
+        try:
+            pid_i = int(pid)
+        except Exception:
+            return "Unknown"
+
+        uid = ""
+        context_username = ""
+        try:
+            context = self._resolve_pid_context(pid_i) or {}
+            uid = str(context.get("user_id") or "").strip()
+            context_username = str(context.get("username") or "").strip()
+        except Exception:
+            pass
+
+        if not uid:
+            try:
+                uid = str((self._antiafk_pid_to_uid or {}).get(pid_i) or "").strip()
+            except Exception:
+                pass
+
+        if not uid:
+            try:
+                for candidate_uid, runtime in (self.user_data or {}).items():
+                    raw_pids = (runtime or {}).get("pids", []) or []
+                    if not isinstance(raw_pids, (list, tuple, set)):
+                        raw_pids = [raw_pids]
+                    for raw_pid in raw_pids:
+                        try:
+                            matches = int(raw_pid) == pid_i
+                        except Exception:
+                            continue
+                        if matches:
+                            uid = str(candidate_uid).strip()
+                            break
+                    if uid:
+                        break
+            except Exception:
+                pass
+
+        if not uid:
+            try:
+                paused = self._paused_worker_state or {}
+                tracker = paused.get("process_tracker", {}) or {}
+                owners = tracker.get("process_owners", {}) or {}
+                uid = str(owners.get(pid_i) or owners.get(str(pid_i)) or "").strip()
+                if not uid:
+                    for candidate_uid, raw_pids in (
+                        tracker.get("user_processes", {}) or {}
+                    ).items():
+                        if not isinstance(raw_pids, (list, tuple, set)):
+                            raw_pids = [raw_pids]
+                        for raw_pid in raw_pids:
+                            try:
+                                matches = int(raw_pid) == pid_i
+                            except Exception:
+                                continue
+                            if matches:
+                                uid = str(candidate_uid).strip()
+                                break
+                        if uid:
+                            break
+            except Exception:
+                pass
+
+        if uid:
+            try:
+                users = self.config_manager.peek_users() or {}
+                info = users.get(uid, {}) if isinstance(users, dict) else {}
+                if not info and isinstance(users, dict):
+                    try:
+                        info = users.get(int(uid), {})
+                    except Exception:
+                        pass
+                configured = str((info or {}).get("username") or "").strip()
+                if configured:
+                    return configured
+            except Exception:
+                pass
+
+        return context_username or "Unknown"
+
+    def _save_merchant_fix_smart_setting(self, enabled: bool) -> bool:
+        try:
+            settings = self.config_manager.load_settings() or {}
+            cfg = settings.get("merchant_fix", {})
+            if not isinstance(cfg, dict):
+                cfg = {}
+            cfg["smart_enabled"] = bool(enabled)
+            settings["merchant_fix"] = cfg
+            return bool(self.config_manager.save_settings(settings))
+        except Exception as exc:
+            self.add_log(f"[Merchant Fix] Could not save Smart mode setting: {exc}")
+            return False
+
+    def _save_merchant_fix_delay_setting(self) -> bool:
+        spin = self._merchant_fix_delay_spin
+        if spin is None:
+            return False
+        trigger = getattr(self, "_merchant_fix_displayed_trigger", None)
+        if trigger is None:
+            trigger = self.merchant_fix_controller.smart_block_trigger
+        delay = self.merchant_fix_controller.set_smart_block_delay_seconds(
+            spin.value(), trigger=trigger
+        )
+        if abs(spin.value() - delay) > 0.0001:
+            spin.blockSignals(True)
+            spin.setValue(delay)
+            spin.blockSignals(False)
+        return self._save_merchant_fix_timing_settings()
+
+    def _save_merchant_fix_timing_settings(self) -> bool:
+        try:
+            settings = self.config_manager.load_settings() or {}
+            cfg = settings.get("merchant_fix", {})
+            if not isinstance(cfg, dict):
+                cfg = {}
+            cfg["smart_block_trigger"] = self.merchant_fix_controller.smart_block_trigger
+            cfg["post_marker_delay_seconds"] = (
+                self.merchant_fix_controller.smart_block_delay_seconds(
+                    SMART_BLOCK_TRIGGER_BOSS_RAID_UI
+                )
+            )
+            cfg["menu_exit_delay_seconds"] = (
+                self.merchant_fix_controller.smart_block_delay_seconds(
+                    SMART_BLOCK_TRIGGER_MENU_EXIT
+                )
+            )
+            settings["merchant_fix"] = cfg
+            saved = bool(self.config_manager.save_settings(settings))
+            if not saved:
+                self.add_log("[Merchant Fix] Could not save the Smart timing settings.")
+            return saved
+        except Exception as exc:
+            self.add_log(f"[Merchant Fix] Could not save the Smart timing settings: {exc}")
+            return False
+
+    def _save_merchant_fix_trigger_setting(self) -> bool:
+        combo = self._merchant_fix_trigger_combo
+        if combo is None:
+            return False
+        previous_trigger = getattr(self, "_merchant_fix_displayed_trigger", None)
+        if previous_trigger is None:
+            previous_trigger = self.merchant_fix_controller.smart_block_trigger
+        spin = getattr(self, "_merchant_fix_delay_spin", None)
+        if spin is not None:
+            self.merchant_fix_controller.set_smart_block_delay_seconds(
+                spin.value(), trigger=previous_trigger
+            )
+        trigger = self.merchant_fix_controller.set_smart_block_trigger(
+            combo.currentData()
+        )
+        self._merchant_fix_displayed_trigger = trigger
+        if spin is not None:
+            delay = self.merchant_fix_controller.smart_block_delay_seconds(trigger)
+            spin.blockSignals(True)
+            spin.setValue(delay)
+            spin.blockSignals(False)
+        return self._save_merchant_fix_timing_settings()
+
+    def _save_merchant_fix_user_selection_setting(self) -> bool:
+        try:
+            settings = self.config_manager.load_settings() or {}
+            cfg = settings.get("merchant_fix", {})
+            if not isinstance(cfg, dict):
+                cfg = {}
+            cfg["smart_user_scope"] = self.merchant_fix_controller.smart_user_scope
+            cfg["smart_user_ids"] = list(self.merchant_fix_controller.smart_user_ids)
+            settings["merchant_fix"] = cfg
+            saved = bool(self.config_manager.save_settings(settings))
+            if not saved:
+                self.add_log("[Merchant Fix] Could not save the Smart user selection.")
+            return saved
+        except Exception as exc:
+            self.add_log(f"[Merchant Fix] Could not save the Smart user selection: {exc}")
+            return False
+
+    def _merchant_fix_user_selection_summary(self) -> str:
+        scope = self.merchant_fix_controller.smart_user_scope
+        selected = self.merchant_fix_controller.smart_user_ids
+        if not selected:
+            if scope == SMART_USER_SCOPE_WHITELIST:
+                return "Whitelist — no users selected"
+            return "Blacklist — no users excluded (all users enabled)"
+        try:
+            users = self.config_manager.peek_users() or {}
+        except Exception:
+            users = {}
+        names: list[str] = []
+        for user_id in selected:
+            info = users.get(user_id, {}) if isinstance(users, dict) else {}
+            if not info and isinstance(users, dict):
+                try:
+                    info = users.get(int(user_id), {})
+                except (TypeError, ValueError):
+                    pass
+            username = str((info or {}).get("username") or user_id).strip()
+            names.append(username or user_id)
+        preview = ", ".join(names[:3])
+        if len(names) > 3:
+            preview += f" +{len(names) - 3} more"
+        if scope == SMART_USER_SCOPE_WHITELIST:
+            return f"Whitelist — {len(names)} included: {preview}"
+        return f"Blacklist — {len(names)} excluded: {preview}"
+
+    @staticmethod
+    def _merchant_fix_filter_hint(scope: str, count: int) -> str:
+        if scope == SMART_USER_SCOPE_WHITELIST:
+            if count:
+                return f"Only the {count} checked user{'s' if count != 1 else ''} will receive Smart protection."
+            return "No users are checked. Smart mode will not apply to future launches."
+        if count:
+            return f"The {count} checked user{'s' if count != 1 else ''} will be excluded from the Smart block."
+        return "No users are excluded. Smart mode will apply to every configured user."
+
+    def _set_merchant_fix_user_selection(self, scope: object, user_ids: object) -> None:
+        self.merchant_fix_controller.set_smart_user_selection(scope, user_ids)
+        self._save_merchant_fix_user_selection_setting()
+        self._refresh_merchant_fix_dialog()
+
+    def _open_merchant_fix_user_selector(self) -> None:
+        try:
+            users = self.config_manager.peek_users() or {}
+        except Exception:
+            users = {}
+        if not isinstance(users, dict):
+            users = {}
+
+        dialog = QDialog(self._merchant_fix_dialog or self)
+        dialog.setWindowTitle("Select Smart Mode Users")
+        dialog.resize(480, 520)
+        layout = QVBoxLayout(dialog)
+        description = QLabel(
+            "Choose whether checked accounts are included in or excluded from the Smart block."
+        )
+        description.setWordWrap(True)
+        layout.addWidget(description)
+
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Selection mode:"))
+        filter_combo = QComboBox()
+        filter_combo.addItem("Whitelist", SMART_USER_SCOPE_WHITELIST)
+        filter_combo.addItem("Blacklist", SMART_USER_SCOPE_BLACKLIST)
+        current_scope = self.merchant_fix_controller.smart_user_scope
+        if current_scope not in {
+            SMART_USER_SCOPE_WHITELIST,
+            SMART_USER_SCOPE_BLACKLIST,
+        }:
+            current_scope = SMART_USER_SCOPE_BLACKLIST
+        filter_index = filter_combo.findData(current_scope)
+        filter_combo.setCurrentIndex(filter_index if filter_index >= 0 else 1)
+        filter_combo.setMinimumWidth(150)
+        mode_row.addWidget(filter_combo)
+        mode_row.addStretch()
+        layout.addLayout(mode_row)
+
+        button_row = QHBoxLayout()
+        select_all = QPushButton("Select All")
+        select_none = QPushButton("Select None")
+        button_row.addWidget(select_all)
+        button_row.addWidget(select_none)
+        button_row.addStretch()
+        layout.addLayout(button_row)
+
+        user_list = QListWidget()
+        current_ids = set(self.merchant_fix_controller.smart_user_ids)
+        ordered_users = sorted(
+            users.items(),
+            key=lambda pair: str((pair[1] or {}).get("username") or pair[0]).lower()
+            if isinstance(pair[1], dict)
+            else str(pair[0]).lower(),
+        )
+        for raw_user_id, raw_info in ordered_users:
+            user_id = str(raw_user_id).strip()
+            if not user_id:
+                continue
+            info = raw_info if isinstance(raw_info, dict) else {}
+            username = str(info.get("username") or user_id).strip()
+            item = QListWidgetItem(f"{username} ({user_id})")
+            item.setData(Qt.ItemDataRole.UserRole, user_id)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.CheckState.Checked if user_id in current_ids else Qt.CheckState.Unchecked
+            )
+            user_list.addItem(item)
+        if not user_list.count():
+            empty_item = QListWidgetItem("No configured users are available.")
+            empty_item.setFlags(empty_item.flags() & ~Qt.ItemFlag.ItemIsEnabled)
+            user_list.addItem(empty_item)
+        layout.addWidget(user_list, 1)
+
+        filter_hint = QLabel()
+        filter_hint.setWordWrap(True)
+        filter_hint.setStyleSheet(f"color:{ModernStyle.TEXT_SECONDARY};")
+        layout.addWidget(filter_hint)
+
+        def _set_all(check_state: Qt.CheckState) -> None:
+            for row in range(user_list.count()):
+                item = user_list.item(row)
+                if item is not None and item.data(Qt.ItemDataRole.UserRole):
+                    item.setCheckState(check_state)
+
+        select_all.clicked.connect(lambda: _set_all(Qt.CheckState.Checked))
+        select_none.clicked.connect(lambda: _set_all(Qt.CheckState.Unchecked))
+        select_all.setEnabled(bool(users))
+        select_none.setEnabled(bool(users))
+
+        def _checked_count() -> int:
+            return sum(
+                1
+                for row in range(user_list.count())
+                if user_list.item(row) is not None
+                and user_list.item(row).checkState() == Qt.CheckState.Checked
+                and user_list.item(row).data(Qt.ItemDataRole.UserRole)
+            )
+
+        def _refresh_filter_hint(*_args) -> None:
+            filter_hint.setText(
+                self._merchant_fix_filter_hint(
+                    str(filter_combo.currentData() or ""), _checked_count()
+                )
+            )
+
+        filter_combo.currentIndexChanged.connect(_refresh_filter_hint)
+        user_list.itemChanged.connect(_refresh_filter_hint)
+        _refresh_filter_hint()
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        selected: list[str] = []
+        for row in range(user_list.count()):
+            item = user_list.item(row)
+            if item is None or item.checkState() != Qt.CheckState.Checked:
+                continue
+            user_id = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+            if user_id:
+                selected.append(user_id)
+        self._set_merchant_fix_user_selection(filter_combo.currentData(), selected)
+
+    def _refresh_merchant_fix_dialog(self) -> None:
+        classic_active = is_classic_block_active()
+        smart_active = bool(self.merchant_fix_controller.smart_enabled)
+        helper_connected = bool(self.merchant_fix_controller.helper_connected)
+        handoff_active = bool(self.merchant_fix_controller.handoff_active)
+        pending = bool(getattr(self, "_merchant_fix_pending", False))
+        roll_ready = bool(getattr(self, "_merchant_fix_roll_ready", False))
+
+        if self._merchant_fix_classic_start_button is not None:
+            self._merchant_fix_classic_start_button.setText("Prepare Classic Fix")
+            self._merchant_fix_classic_start_button.setEnabled(
+                not pending and not classic_active and not self._merchant_fix_manager_active()
+            )
+        if self._merchant_fix_roll_button is not None:
+            self._merchant_fix_roll_button.setEnabled(not pending and roll_ready and not self._merchant_fix_manager_active())
+        if self._merchant_fix_classic_disable_button is not None:
+            self._merchant_fix_classic_disable_button.setEnabled(not pending and classic_active)
+        if self._merchant_fix_smart_enable_button is not None:
+            self._merchant_fix_smart_enable_button.setEnabled(not pending and not smart_active)
+        if self._merchant_fix_smart_disable_button is not None:
+            self._merchant_fix_smart_disable_button.setEnabled(not pending and smart_active)
+        if self._merchant_fix_delay_spin is not None:
+            self._merchant_fix_delay_spin.setEnabled(not pending)
+        if self._merchant_fix_trigger_combo is not None:
+            self._merchant_fix_trigger_combo.setEnabled(not pending)
+        if self._merchant_fix_users_button is not None:
+            self._merchant_fix_users_button.setEnabled(not pending)
+        if self._merchant_fix_users_summary_label is not None:
+            self._merchant_fix_users_summary_label.setText(
+                self._merchant_fix_user_selection_summary()
+            )
+
+        status = self._merchant_fix_status_label
+        badge_text = "Disabled"
+        badge_color = ModernStyle.TEXT_SECONDARY
+        if status is not None:
+            if pending:
+                text, color = "Merchant Fix operation in progress…", ModernStyle.WARNING
+                badge_text, badge_color = "Working", ModernStyle.WARNING
+            elif classic_active:
+                text, color = (
+                    "Classic hosts-file block active: assetdelivery.roblox.com is blocked globally.",
+                    ModernStyle.SECONDARY,
+                )
+                badge_text, badge_color = "Classic active", ModernStyle.SECONDARY
+            elif smart_active:
+                coverage = self._merchant_fix_user_selection_summary().lower()
+                if helper_connected:
+                    trigger_label = (
+                        "main-menu exit"
+                        if self.merchant_fix_controller.smart_block_trigger
+                        == SMART_BLOCK_TRIGGER_MENU_EXIT
+                        else "BossRaidUI marker"
+                    )
+                    text, color = (
+                        f"Smart mode enabled for {coverage}. Matching launches are being watched for {trigger_label}.",
+                        ModernStyle.SECONDARY,
+                    )
+                    badge_text, badge_color = "Smart active", ModernStyle.SECONDARY
+                elif handoff_active:
+                    text, color = (
+                        "Smart PID blocks remain active by the paused-manager handoff.",
+                        ModernStyle.SECONDARY,
+                    )
+                    badge_text, badge_color = "Smart handoff", ModernStyle.SECONDARY
+                else:
+                    text, color = (
+                        "Smart mode is enabled, but its helper is not connected. It will reconnect when Blocking is next needed.",
+                        ModernStyle.WARNING,
+                    )
+                    badge_text, badge_color = "Smart waiting", ModernStyle.WARNING
+            elif self._merchant_fix_manager_active():
+                text, color = "Manager active. Classic mode is locked until the manager is stopped.", ModernStyle.WARNING
+                badge_text, badge_color = "Manager active", ModernStyle.WARNING
+            elif roll_ready:
+                text, color = "rbx-storage cleared. Load to the Play button, then apply Roll Fix.", ModernStyle.WARNING
+                badge_text, badge_color = "Roll Fix ready", ModernStyle.WARNING
+            else:
+                text, color = "Merchant Fix is disabled.", ModernStyle.TEXT_SECONDARY
+            status.setText(text)
+            status.setStyleSheet(f"color:{color}; font-weight:bold;")
+
+        header_state = self._merchant_fix_header_state_label
+        if header_state is not None:
+            header_state.setText(badge_text)
+            header_state.setStyleSheet(
+                f"color:{badge_color}; border:1px solid {badge_color}; "
+                "border-radius:10px; font-weight:600;"
+            )
+
+        block_rows: list[tuple[str, str, str, str, str]] = []
+        if classic_active:
+            block_rows.append(
+                (
+                    "Classic",
+                    "All users",
+                    "All processes",
+                    "assetdelivery.roblox.com",
+                    "Active",
+                )
+            )
+        try:
+            smart_blocks = sorted(
+                self.merchant_fix_controller.current_blocks(),
+                key=lambda item: int(item.get("pid") or 0),
+            )
+        except Exception:
+            smart_blocks = []
+        for block in smart_blocks:
+            pid = int(block.get("pid") or 0)
+            block_rows.append(
+                (
+                    "Smart",
+                    self._merchant_fix_username_for_pid(pid),
+                    f"PID {pid}",
+                    str(block.get("domain") or "assetdelivery.roblox.com"),
+                    str(block.get("state") or "Active"),
+                )
+            )
+
+        summary = self._merchant_fix_blocks_summary_label
+        if summary is not None:
+            count = len(block_rows)
+            if count:
+                summary.setText(f"{count} current block{'s' if count != 1 else ''}")
+            elif smart_active:
+                summary.setText("No active blocks — waiting for a matching managed Roblox process")
+            else:
+                summary.setText("No active blocks")
+
+        blocks_table = self._merchant_fix_blocks_table
+        signature = tuple(block_rows)
+        if blocks_table is not None and signature != self._merchant_fix_blocks_signature:
+            blocks_table.setRowCount(len(block_rows))
+            for row, values in enumerate(block_rows):
+                for column, value in enumerate(values):
+                    item = QTableWidgetItem(value)
+                    if column in (0, 2, 4):
+                        item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    if column == 4:
+                        color = (
+                            ModernStyle.SECONDARY
+                            if value in ("Active", "Handoff active")
+                            else ModernStyle.WARNING
+                        )
+                        item.setForeground(QBrush(QColor(color)))
+                    blocks_table.setItem(row, column, item)
+            self._merchant_fix_blocks_signature = signature
+
+        box = self._merchant_fix_log_box
+        if box is not None:
+            try:
+                path = get_merchant_fix_log_path()
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[-100:]
+                current = "\n".join(lines)
+                if box.toPlainText() != current:
+                    box.setPlainText(current)
+                    box.moveCursor(QTextCursor.MoveOperation.End)
+            except Exception:
+                pass
+
+    def _run_merchant_fix_operation(self, operation: str, function) -> None:
+        if self._merchant_fix_pending:
+            return
+        self._merchant_fix_pending = True
+        self._merchant_fix_pending_operation = str(operation)
+        try:
+            self.start_btn.setEnabled(False)
+        except Exception:
+            pass
+        self._refresh_merchant_fix_dialog()
+
+        def _work() -> None:
+            try:
+                message = str(function() or "")
+                self.merchant_fix_result_signal.emit(operation, True, message)
+            except Exception as exc:
+                self.merchant_fix_result_signal.emit(operation, False, str(exc))
+
+        try:
+            self._antiafk_thread_pool.start(_FunctionRunnable(_work))
+        except Exception:
+            threading.Thread(target=_work, daemon=True).start()
+
+    def _start_merchant_fix_classic(self) -> None:
+        if is_classic_block_active():
+            QMessageBox.information(
+                self,
+                "Classic Block Already Active",
+                "Disable the existing Classic block before starting the Classic setup again.",
+            )
+            return
+        if self._merchant_fix_manager_active():
+            QMessageBox.warning(
+                self,
+                "Manager Is Running",
+                "Stop the manager before starting Classic Merchant Fix. Classic mode must close every Roblox window.",
+            )
+            return
+        count = len(self._roblox_process_pids())
+        reply = QMessageBox.question(
+            self,
+            "Start Classic Merchant Fix",
+            f"This will close {count} Roblox process(es) and permanently delete every item inside:\n\n"
+            f"{get_roblox_storage_dir()}\n\nIt will also delete rbx-storage.db, "
+            "rbx-storage.db-wal, and rbx-storage.db-shm from the Roblox folder.\n\nContinue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        def _prepare() -> str:
+            self.merchant_fix_controller.recover_stale_acl_if_needed()
+            closed = close_roblox_processes()
+            removed = clear_roblox_storage()
+            return f"Closed {closed} Roblox process(es) and removed {removed} rbx-storage item(s)."
+
+        self._run_merchant_fix_operation("classic_prepare", _prepare)
+
+    def _apply_merchant_fix_roll(self) -> None:
+        if not self._merchant_fix_roll_ready:
+            return
+        self._apply_merchant_fix_classic_block(use_roll_fix=True)
+
+    def _apply_merchant_fix_classic_block(self, *, use_roll_fix: bool) -> None:
+        if self._merchant_fix_manager_active():
+            QMessageBox.warning(
+                self,
+                "Manager Is Running",
+                "Stop the manager before applying the Classic block.",
+            )
+            return
+        smart_was_enabled = bool(self.merchant_fix_controller.smart_enabled)
+        if smart_was_enabled:
+            reply = QMessageBox.question(
+                self,
+                "Switch to Classic Mode",
+                "Applying the global Classic block will disable Smart mode. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        if use_roll_fix:
+            reply = QMessageBox.question(
+                self,
+                "Apply Roll Fix",
+                "J.JARAM will now close every Roblox window and block assetdelivery.roblox.com for the whole PC. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        def _apply() -> str:
+            closed = close_roblox_processes()
+            if smart_was_enabled:
+                self.merchant_fix_controller.deactivate_smart()
+            try:
+                self.merchant_fix_controller.enable_classic_block()
+            except Exception:
+                if smart_was_enabled:
+                    try:
+                        self.merchant_fix_controller.activate_smart()
+                    except Exception:
+                        pass
+                raise
+            if use_roll_fix:
+                return f"Roll Fix applied after closing {closed} Roblox process(es)."
+            return f"Classic block applied without Roll Fix after closing {closed} Roblox process(es)."
+
+        operation = "classic_apply_roll" if use_roll_fix else "classic_apply_standard"
+        self._run_merchant_fix_operation(operation, _apply)
+
+    def _disable_merchant_fix_classic(self) -> None:
+        reply = QMessageBox.question(
+            self,
+            "Disable Classic Block",
+            "Remove J.JARAM's global assetdelivery.roblox.com block?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self._run_merchant_fix_operation(
+            "classic_disable", lambda: (self.merchant_fix_controller.disable_classic_block() or "Classic block disabled.")
+        )
+
+    def _enable_merchant_fix_smart(self) -> None:
+        self._save_merchant_fix_trigger_setting()
+        self._save_merchant_fix_delay_setting()
+        if (
+            self.merchant_fix_controller.smart_user_scope == SMART_USER_SCOPE_WHITELIST
+            and not self.merchant_fix_controller.smart_user_ids
+        ):
+            QMessageBox.warning(
+                self,
+                "Select Smart Mode Users",
+                "Choose at least one user before enabling Smart mode.",
+            )
+            return
+        classic_active = is_classic_block_active()
+        if classic_active:
+            reply = QMessageBox.question(
+                self,
+                "Switch to Smart Mode",
+                "The global Classic block is active. It must be removed before Smart mode is enabled. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        def _enable() -> str:
+            if classic_active:
+                self.merchant_fix_controller.disable_classic_block()
+            try:
+                self.merchant_fix_controller.activate_smart()
+            except Exception:
+                if classic_active:
+                    try:
+                        self.merchant_fix_controller.enable_classic_block()
+                    except Exception:
+                        pass
+                raise
+            return "Smart mode enabled."
+
+        self._run_merchant_fix_operation("smart_enable", _enable)
+
+    def _disable_merchant_fix_smart(self) -> None:
+        self._run_merchant_fix_operation(
+            "smart_disable", lambda: (self.merchant_fix_controller.deactivate_smart() or "Smart mode disabled.")
+        )
+
+    def _on_merchant_fix_operation_finished(self, operation: str, success: bool, message: str) -> None:
+        self._merchant_fix_pending = False
+        self._merchant_fix_pending_operation = ""
+        if success:
+            self.add_log(f"[Merchant Fix] {message}")
+            if operation == "classic_prepare":
+                reply = QMessageBox.question(
+                    self,
+                    "Apply Roll Fix?",
+                    f"{message}\n\nWould you like to apply Roll Fix?\n\n"
+                    "Yes: launch Roblox and wait until the Play button appears, then return here.\n"
+                    "No: skip Roll Fix and apply the Classic hosts block immediately.",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+                self._merchant_fix_roll_ready = reply == QMessageBox.StandardButton.Yes
+                if not self._merchant_fix_roll_ready:
+                    self._apply_merchant_fix_classic_block(use_roll_fix=False)
+            elif operation in ("classic_apply_roll", "classic_apply_standard"):
+                self._merchant_fix_roll_ready = False
+                self.merchant_fix_controller.set_smart_enabled(False)
+                self._save_merchant_fix_smart_setting(False)
+                title = "Roll Fix Applied" if operation == "classic_apply_roll" else "Classic Block Applied"
+                QMessageBox.information(self, title, message)
+            elif operation == "classic_disable":
+                QMessageBox.information(self, "Classic Block Disabled", message)
+            elif operation == "smart_enable":
+                self._save_merchant_fix_smart_setting(True)
+                QMessageBox.information(self, "Smart Mode Enabled", message)
+            elif operation == "smart_disable":
+                self._save_merchant_fix_smart_setting(False)
+                QMessageBox.information(self, "Smart Mode Disabled", message)
+        else:
+            if operation == "smart_disable" and not self.merchant_fix_controller.smart_enabled:
+                self._save_merchant_fix_smart_setting(False)
+            self.add_log(f"[Merchant Fix] {operation} failed: {message}")
+            QMessageBox.warning(self, "Merchant Fix Failed", message or "The operation failed.")
+        try:
+            manager_running = bool(self.worker_thread and self.worker_thread.isRunning())
+            self.start_btn.setEnabled(
+                not self._merchant_fix_pending
+                and not manager_running
+                and not self._manager_paused
+            )
+        except Exception:
+            pass
+        self._refresh_merchant_fix_dialog()
 
     def show_multi_instance_window(self) -> None:
         """Show the Extras dialog used to control Roblox's singleton guard."""
@@ -11507,9 +13284,9 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             )
         except Exception:
             self._multi_instance_enabled = False
-        process_count = self._refresh_multi_instance_process_snapshot()
-        self._multi_instance_last_process_count = int(process_count)
         if self._multi_instance_enabled:
+            process_count = self._refresh_multi_instance_process_snapshot()
+            self._multi_instance_last_process_count = int(process_count)
             self._request_multi_instance_operation(
                 True,
                 refresh=False,
@@ -11517,6 +13294,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 action="startup",
             )
         else:
+            self._multi_instance_process_count = 0
+            self._multi_instance_last_process_count = 0
             self._update_multi_instance_dialog()
 
     def _check_multi_instance_process_state(self) -> None:
@@ -12550,6 +14329,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         header.setSectionResizeMode(11, QHeaderView.ResizeMode.Interactive)      # Anti-AFK Age
         header.setSectionResizeMode(12, QHeaderView.ResizeMode.Fixed)            # Actions
 
+        self._connect_virtual_table_actions(self.users_table)
+
         self.users_table.setColumnWidth(0, 100)
         self.users_table.setColumnWidth(1, 160)
         self.users_table.setColumnWidth(2, 200)
@@ -12810,17 +14591,20 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.accounts_list.setColumnCount(6)
         self.accounts_list.setHorizontalHeaderLabels(["User ID", "Username", "Server Type", "Status", "Actions", "Delete"])
         header = self.accounts_list.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
+        self.accounts_list.setColumnWidth(0, 90)
         self.accounts_list.setColumnWidth(1, 120)
+        self.accounts_list.setColumnWidth(2, 95)
         self.accounts_list.setColumnWidth(4, 90)
         self.accounts_list.setColumnWidth(5, 80)
         self._accounts_activity_delegate = _ActivityDotDelegate(self.accounts_list)
         self.accounts_list.setItemDelegateForColumn(3, self._accounts_activity_delegate)
+        self._connect_virtual_table_actions(self.accounts_list)
         self.accounts_list.verticalHeader().setDefaultSectionSize(35)
         try:
             self.accounts_list.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -12838,7 +14622,6 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         scroll.setWidgetResizable(True)
         scroll.setWidget(accounts_widget)
         self.accounts_tab_index = self.tab_widget.addTab(scroll, "Accounts")
-        self.refresh_accounts_list()
 
     def setup_logs_tab(self):
         logs_widget = QWidget()
@@ -12891,7 +14674,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(logs_widget)
-        self.tab_widget.addTab(scroll, "Logs")
+        self.logs_tab_index = self.tab_widget.addTab(scroll, "Logs")
 
     def setup_ocr_tab(self):
         ocr_widget = QWidget()
@@ -12916,11 +14699,23 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.ocr_workers_spin = QSpinBox(); self.ocr_workers_spin.setRange(1, 16)
         self.ocr_workers_spin.valueChanged.connect(self._on_ocr_settings_changed)
         self.ocr_max_caps_spin = QSpinBox(); self.ocr_max_caps_spin.setRange(1, 60)
-        self.ocr_max_caps_spin.setToolTip("Maximum number of window captures per OCR batch.")
+        self.ocr_max_caps_spin.setToolTip(
+            "Separate mode: maximum window captures per loop. Combined mode: maximum OCR images "
+            "in each composite; additional images create another composite in the same loop."
+        )
         self.ocr_max_caps_spin.valueChanged.connect(self._on_ocr_settings_changed)
         self.ocr_batch_delay_spin = QDoubleSpinBox(); self.ocr_batch_delay_spin.setRange(0.0, 60.0); self.ocr_batch_delay_spin.setDecimals(2); self.ocr_batch_delay_spin.setSingleStep(0.1); self.ocr_batch_delay_spin.setSuffix(" s")
         self.ocr_batch_delay_spin.setToolTip("Minimum delay between OCR capture batches (lower = more frequent batches).")
         self.ocr_batch_delay_spin.valueChanged.connect(self._on_ocr_settings_changed)
+        self.ocr_processing_mode_combo = QComboBox()
+        self.ocr_processing_mode_combo.addItem("Separate images (Default)", "separate")
+        self.ocr_processing_mode_combo.addItem("Combined batch (Faster)", "combined")
+        self.ocr_processing_mode_combo.setToolTip(
+            "Combined batch tiles the prepared chat captures and runs their broad OCR pass together. "
+            "Filter verification remains full-size, but the broad scan may recognize small text "
+            "differently because the composite is resized."
+        )
+        self.ocr_processing_mode_combo.currentIndexChanged.connect(self._on_ocr_settings_changed)
         self.ocr_preprocess_chk = QCheckBox("Use preprocessing")
         self.ocr_preprocess_chk.toggled.connect(self._on_ocr_settings_changed)
         self.ocr_frame_diff_tol_spin = QSpinBox(); self.ocr_frame_diff_tol_spin.setRange(0, 100); self.ocr_frame_diff_tol_spin.setSuffix(" %")
@@ -12931,8 +14726,9 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self._load_ocr_device_choices()
 
         controls_form.addRow("OCR workers:", self.ocr_workers_spin)
-        controls_form.addRow("Max captures / batch:", self.ocr_max_caps_spin)
+        controls_form.addRow("Max images / batch:", self.ocr_max_caps_spin)
         controls_form.addRow("Batch delay:", self.ocr_batch_delay_spin)
+        controls_form.addRow("Processing mode:", self.ocr_processing_mode_combo)
         controls_form.addRow("Preprocess chat image:", self.ocr_preprocess_chk)
         controls_form.addRow("Processor:", self.ocr_device_combo)
         controls_form.addRow("Skip OCR if frame change ≤:", self.ocr_frame_diff_tol_spin)
@@ -13130,7 +14926,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(ocr_widget)
-        self.tab_widget.addTab(scroll, "OCR")
+        self.ocr_tab_index = self.tab_widget.addTab(scroll, "OCR")
 
     def setup_antiafk_tab(self):
         antiafk_widget = QWidget()
@@ -13356,14 +15152,15 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.antiafk_unthrottle_lead_spin.valueChanged.connect(self._on_antiafk_ui_changed)
         self.antiafk_enable_chk.toggled.connect(self._on_antiafk_ui_changed)
 
-        # Ensure initial engine config (including multi-instance) is applied
-        self._on_antiafk_ui_changed()
+        # Apply the loaded values to the engine without arming a redundant
+        # settings.json write as soon as the event loop starts.
+        self._on_antiafk_ui_changed(persist=False)
         QTimer.singleShot(0, self._restore_multi_instance_state)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(antiafk_widget)
-        self.tab_widget.addTab(scroll, "Anti AFK")
+        self.antiafk_tab_index = self.tab_widget.addTab(scroll, "Anti AFK")
 
     def _emit_antiafk_status(self, message: str):
         """Called from AntiAFK worker threads to forward status messages."""
@@ -13376,7 +15173,20 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
     def _emit_antiafk_touch(self, pid: int):
         """Called from AntiAFK worker threads when a PID is successfully touched."""
         try:
-            self.antiafk_touch_signal.emit(int(pid))
+            pid_i = int(pid)
+        except Exception:
+            return
+
+        # Update the thread-safe overdue state immediately. Routing solely
+        # through the queued Qt signal leaves a window where Auto-Actions can
+        # still observe the old timestamp after the native action completed.
+        try:
+            self._record_antiafk_touch(pid_i, time.time())
+        except Exception:
+            pass
+
+        try:
+            self.antiafk_touch_signal.emit(pid_i)
         except Exception:
             pass
 
@@ -13815,25 +15625,136 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
     def _on_antiafk_touch(self, pid: int) -> None:
         """Qt slot: update per-user last-touch timestamps from Anti-AFK hits."""
+        self._record_antiafk_touch(pid)
+
+    def _resolve_antiafk_touch_uid(self, pid: int) -> str:
+        """Resolve a successful Anti-AFK PID without relying on one UI cache."""
         try:
             pid_i = int(pid)
         except Exception:
-            return
+            return ""
+        if pid_i <= 0:
+            return ""
+
+        # The manager-owned tracker is the freshest ownership source during
+        # process replacement and reconnects.
+        try:
+            wt = getattr(self, "worker_thread", None)
+            tracker = getattr(getattr(wt, "manager", None), "process_tracker", None)
+            owners = getattr(tracker, "process_owners", {}) or {}
+            uid = owners.get(pid_i) or owners.get(str(pid_i))
+            uid_s = str(uid or "").strip()
+            if uid_s:
+                return uid_s
+        except Exception:
+            pass
+
+        # user_data is the current complete account/PID snapshot and may be
+        # newer than _antiafk_pid_to_uid for a short time.
+        try:
+            for uid, runtime in (self.user_data or {}).items():
+                pids = (runtime or {}).get("pids", []) or []
+                if not isinstance(pids, (list, tuple, set)):
+                    pids = [pids]
+                for candidate in pids:
+                    try:
+                        if int(candidate) == pid_i:
+                            return str(uid or "").strip()
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+        try:
+            pdata = (self.process_data or {}).get(pid_i)
+            if pdata is None:
+                pdata = (self.process_data or {}).get(str(pid_i))
+            if isinstance(pdata, dict):
+                uid_s = str(pdata.get("user_id") or "").strip()
+                if uid_s:
+                    return uid_s
+        except Exception:
+            pass
 
         with self._antiafk_touch_lock:
             uid = self._antiafk_pid_to_uid.get(pid_i)
+        uid_s = str(uid or "").strip()
+        if uid_s:
+            return uid_s
+
+        # Some tracker implementations publish user_processes before
+        # process_owners. Check that secondary ownership map as a last resort.
+        try:
+            user_processes = getattr(tracker, "user_processes", {}) or {}
+            for uid, pids in user_processes.items():
+                if not isinstance(pids, (list, tuple, set)):
+                    pids = [pids]
+                for candidate in pids or []:
+                    try:
+                        if int(candidate) == pid_i:
+                            return str(uid or "").strip()
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+        return ""
+
+    def _record_antiafk_touch(self, pid: int, ts: Optional[float] = None) -> bool:
+        """Record a native Anti-AFK hit, or retain it until PID ownership is known."""
+        try:
+            pid_i = int(pid)
+        except Exception:
+            return False
+        if pid_i <= 0:
+            return False
+
+        try:
+            now_ts = time.time() if ts is None else float(ts)
+        except Exception:
+            now_ts = time.time()
+        if now_ts <= 0.0:
+            now_ts = time.time()
+
+        with self._antiafk_touch_lock:
+            touches_by_pid = getattr(self, "_antiafk_last_touch_by_pid", None)
+            if touches_by_pid is None:
+                touches_by_pid = {}
+                self._antiafk_last_touch_by_pid = touches_by_pid
+            touches_by_pid[pid_i] = max(
+                float(touches_by_pid.get(pid_i, 0.0) or 0.0),
+                float(now_ts),
+            )
+
+        uid = self._resolve_antiafk_touch_uid(pid_i)
         if not uid:
-            return
+            with self._antiafk_touch_lock:
+                pending = getattr(self, "_antiafk_pending_touch_by_pid", None)
+                if pending is None:
+                    pending = {}
+                    self._antiafk_pending_touch_by_pid = pending
+                pending[pid_i] = max(float(pending.get(pid_i, 0.0) or 0.0), float(now_ts))
+            return False
 
         runtime = (self.user_data or {}).get(str(uid), {}) or {}
         server = str(runtime.get("server", "") or "")
         if self._is_disconnected_server_label(server):
-            return
+            with self._antiafk_touch_lock:
+                getattr(self, "_antiafk_pending_touch_by_pid", {}).pop(pid_i, None)
+                getattr(self, "_antiafk_last_touch_by_pid", {}).pop(pid_i, None)
+            return False
 
-        now_ts = time.time()
         with self._antiafk_touch_lock:
-            self._antiafk_last_touch_by_uid[str(uid)] = float(now_ts)
-            self._antiafk_last_action_by_uid[str(uid)] = float(now_ts)
+            uid_s = str(uid)
+            self._antiafk_last_touch_by_uid[uid_s] = max(
+                float(self._antiafk_last_touch_by_uid.get(uid_s, 0.0) or 0.0),
+                float(now_ts),
+            )
+            self._antiafk_last_action_by_uid[uid_s] = max(
+                float(self._antiafk_last_action_by_uid.get(uid_s, 0.0) or 0.0),
+                float(now_ts),
+            )
+            getattr(self, "_antiafk_pending_touch_by_pid", {}).pop(pid_i, None)
         try:
             wt = getattr(self, "worker_thread", None)
             fn = getattr(wt, "record_antiafk_action", None)
@@ -13841,6 +15762,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 fn(str(uid), float(now_ts))
         except Exception:
             pass
+        return True
 
     def _on_antiafk_pre_action(self, seconds_until_action: float) -> None:
         try:
@@ -13935,7 +15857,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             except Exception:
                 pass
 
-    def _on_antiafk_ui_changed(self):
+    def _on_antiafk_ui_changed(self, *_args, persist: bool = True):
         """Apply current Anti-AFK UI values to the engine and persist them."""
         if self._loading_antiafk_settings or not self.antiafk:
             return
@@ -13979,8 +15901,9 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             if self._is_manager_running():
                 self._run_antiafk_async("toggle_antiafk", enabled_flag)
 
-            # Persist Anti-AFK settings to disk so they survive relaunch.
-            self._schedule_antiafk_save()
+            # Persist user changes, but not the initial widget-to-engine sync.
+            if persist:
+                self._schedule_antiafk_save()
         except Exception:
             # AntiAFK will log detailed errors via its own log_error method.
             pass
@@ -14827,23 +16750,22 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             except Exception:
                 pass
             try:
-                users = self.config_manager.load_users() or {}
+                users = self.config_manager.peek_users() or {}
                 info = users.get(str(uid), {}) or {}
                 return str(info.get("username") or uid)
             except Exception:
                 return str(uid)
 
         def _user_ids_provider() -> List[str]:
-            try:
-                users = self.config_manager.peek_users() or {}
-            except Exception:
-                try:
-                    users = self.config_manager.load_users() or {}
-                except Exception:
-                    users = {}
-            if not isinstance(users, dict):
-                return []
-            return [str(uid).strip() for uid in users.keys() if str(uid).strip()]
+            # Blacklist mode means "all running users except...". Offline and
+            # disabled accounts cannot receive input and need not be scanned.
+            return [
+                str(uid).strip()
+                for uid, runtime in (self.user_data or {}).items()
+                if str(uid).strip()
+                and isinstance(runtime, dict)
+                and bool(runtime.get("pids"))
+            ]
 
         def _log_filename_provider(uid: str) -> str:
             try:
@@ -15497,7 +17419,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
     def _auto_item_refresh_users(self):
         try:
-            users = self.config_manager.load_users() or {}
+            users = self.config_manager.peek_users() or {}
         except Exception:
             users = {}
 
@@ -15510,28 +17432,37 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             except Exception:
                 selected = []
 
-        # Clear existing
-        try:
-            while self.auto_item_users_vbox.count():
-                item = self.auto_item_users_vbox.takeAt(0)
-                w = item.widget()
-                if w:
-                    w.setParent(None)
-        except Exception:
-            pass
+        users_list = getattr(self, "auto_item_users_list", None)
+        if isinstance(users_list, QListWidget):
+            users_list.blockSignals(True)
+            users_list.clear()
+        else:
+            try:
+                while self.auto_item_users_vbox.count():
+                    item = self.auto_item_users_vbox.takeAt(0)
+                    widget = item.widget()
+                    if widget:
+                        widget.setParent(None)
+            except Exception:
+                pass
 
         self.auto_item_user_checks = {}
         for uid in sorted(users.keys(), key=lambda u: (users.get(u, {}) or {}).get("username", str(u))):
             info = users.get(uid, {}) or {}
             uname = info.get("username", uid)
-            cb = QCheckBox(f"{uname} ({uid})")
-            cb.setProperty("user_id", str(uid))
-            cb.setProperty("search_text", f"{uname} {uid}".lower())
-            cb.toggled.connect(self._on_auto_item_user_selection_changed)
-            self.auto_item_users_vbox.addWidget(cb)
+            if isinstance(users_list, QListWidget):
+                cb = _AccountCheckListItem(f"{uname} ({uid})", str(uid), f"{uname} {uid}".lower())
+                users_list.addItem(cb)
+            else:
+                cb = QCheckBox(f"{uname} ({uid})")
+                cb.setProperty("user_id", str(uid))
+                cb.setProperty("search_text", f"{uname} {uid}".lower())
+                cb.toggled.connect(self._on_auto_item_user_selection_changed)
+                self.auto_item_users_vbox.addWidget(cb)
             self.auto_item_user_checks[str(uid)] = cb
 
-        self.auto_item_users_vbox.addStretch()
+        if not isinstance(users_list, QListWidget):
+            self.auto_item_users_vbox.addStretch()
         self._auto_item_user_list_initialized = True
 
         # Apply selection without triggering persistence churn
@@ -15541,23 +17472,36 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             self._apply_auto_item_users_to_ui(selected)
         finally:
             self._loading_autoitem_settings = prev
+            if isinstance(users_list, QListWidget):
+                users_list.blockSignals(False)
 
         self._auto_item_filter_users()
         self._auto_item_update_users_hint()
         try:
-            self._auto_item_last_users_mtime = float(self.config_manager.get_users_mtime())
+            self._auto_item_last_users_signature = self.config_manager.get_users_catalog_signature()
         except Exception:
-            self._auto_item_last_users_mtime = None
+            self._auto_item_last_users_signature = None
 
     def _auto_item_refresh_users_if_changed(self) -> None:
         try:
-            current_mtime = float(self.config_manager.get_users_mtime())
+            current_signature = self.config_manager.get_users_catalog_signature()
         except Exception:
             return
-        previous_mtime = getattr(self, "_auto_item_last_users_mtime", None)
-        if previous_mtime is None or current_mtime != previous_mtime:
+        previous_signature = getattr(self, "_auto_item_last_users_signature", None)
+        if previous_signature is None or current_signature != previous_signature:
+            selected_before = {
+                uid for uid, item in (getattr(self, "auto_item_user_checks", {}) or {}).items()
+                if item.isChecked()
+            }
             self._auto_item_refresh_users()
-            self._on_auto_item_ui_changed()
+            selected_after = {
+                uid for uid, item in (getattr(self, "auto_item_user_checks", {}) or {}).items()
+                if item.isChecked()
+            }
+            # Persist only when an account was removed from the selection. A
+            # rename should merely update its label.
+            if selected_after != selected_before:
+                self._on_auto_item_ui_changed()
 
     def _auto_item_filter_users(self, query: Optional[str] = None) -> None:
         if query is None:
@@ -17048,12 +18992,48 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "roi": self._ocr_empty_roi_cfg() if hasattr(self, "_ocr_empty_roi_cfg") else {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0},
             "color": "#FFFFFF",
             "tolerance": 10,
+            "color_checks": [],
             "target_text": "",
             "match_mode": "contains",
             "case_sensitive": False,
             "filter_ids": [],
             "color_filters": [],
         }
+
+    def _normalize_auto_item_color_checks(self, raw: Any, *, default_tolerance: int = 10) -> List[dict]:
+        if not isinstance(raw, (list, tuple)):
+            return []
+        out: List[dict] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            point_raw = item.get("point") or item.get("condition_point")
+            if not isinstance(point_raw, dict) and "x" in item and "y" in item:
+                point_raw = item
+            if not isinstance(point_raw, dict):
+                continue
+            try:
+                point = {
+                    "x": float(point_raw.get("x", 0.0)),
+                    "y": float(point_raw.get("y", 0.0)),
+                }
+                tolerance = max(
+                    0,
+                    min(
+                        255,
+                        int(item.get("tolerance", item.get("tol", default_tolerance)) or 0),
+                    ),
+                )
+            except Exception:
+                continue
+            out.append(
+                {
+                    "point": point,
+                    "color": str(item.get("color") or item.get("color_hex") or "#FFFFFF").strip() or "#FFFFFF",
+                    "tolerance": tolerance,
+                }
+            )
+        return out
 
     def _normalize_auto_item_ocr_color_filters(self, raw: Any) -> List[dict]:
         if not isinstance(raw, (list, tuple)):
@@ -17148,6 +19128,25 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         except Exception:
             tolerance = max(0, int(legacy_tolerance or 0))
 
+        point = _point(base.get("point") or base.get("condition_point") or base.get("conditional_point")) or copy.deepcopy(legacy_point)
+        color = str(base.get("color") or base.get("color_hex") or legacy_color or "#FFFFFF").strip() or "#FFFFFF"
+        color_check_keys = ("color_checks", "color_pairs", "point_color_pairs")
+        has_explicit_color_checks = any(key in base for key in color_check_keys)
+        raw_color_checks = next((base.get(key) for key in color_check_keys if key in base), None)
+        color_checks = (
+            self._normalize_auto_item_color_checks(raw_color_checks, default_tolerance=tolerance)
+            if has_explicit_color_checks
+            else []
+        )
+        if not has_explicit_color_checks and isinstance(point, dict):
+            color_checks = [
+                {
+                    "point": copy.deepcopy(point),
+                    "color": color,
+                    "tolerance": tolerance,
+                }
+            ]
+
         match_mode = str(base.get("match_mode") or base.get("ocr_match_mode") or "contains").strip().lower()
         if match_mode not in ("contains", "equals", "regex", "fuzzy"):
             match_mode = "contains"
@@ -17164,10 +19163,11 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         return {
             "enabled": bool(base.get("enabled", fallback_enabled)),
             "type": ctype,
-            "point": _point(base.get("point") or base.get("condition_point") or base.get("conditional_point")) or copy.deepcopy(legacy_point),
+            "point": point,
             "roi": _roi(base.get("roi") or base.get("area") or base.get("ocr_roi")),
-            "color": str(base.get("color") or base.get("color_hex") or legacy_color or "#FFFFFF").strip() or "#FFFFFF",
+            "color": color,
             "tolerance": tolerance,
+            "color_checks": color_checks,
             "target_text": str(base.get("target_text") or base.get("ocr_text") or base.get("text") or "").strip(),
             "match_mode": match_mode,
             "case_sensitive": bool(base.get("case_sensitive", False)),
@@ -17198,19 +19198,23 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 "fuzzy": "fuzzy matches",
             }.get(str(cond.get("match_mode") or "contains"), "contains")
             return f"OCR conditional: {area}{filter_text}" + (f" {match_label} '{target}'" if target else "")
-        point = cond.get("point") if isinstance(cond.get("point"), dict) else None
-        if isinstance(point, dict):
+        checks = self._normalize_auto_item_color_checks(cond.get("color_checks") or [])
+        if len(checks) > 1:
+            return f"Color conditional: all {len(checks)} point/color pairs must match"
+        if len(checks) == 1:
+            check = checks[0]
+            point = check["point"]
             return (
-                f"Color conditional: {str(cond.get('color') or '#FFFFFF')} +/- {int(cond.get('tolerance', 10) or 10)} "
+                f"Color conditional: {str(check.get('color') or '#FFFFFF')} +/- {int(check.get('tolerance', 10) or 10)} "
                 f"at {float(point.get('x', 0.0)):.4f}, {float(point.get('y', 0.0)):.4f}"
             )
-        return f"Color conditional: {str(cond.get('color') or '#FFFFFF')} +/- {int(cond.get('tolerance', 10) or 10)}"
+        return "Color conditional: no point/color pairs configured"
 
     def _auto_item_key_options(self) -> List[str]:
         letters = [chr(code) for code in range(ord("A"), ord("Z") + 1)]
         numbers = [str(i) for i in range(10)]
         function_keys = [f"F{i}" for i in range(1, 25)]
-        named = [
+        common = [
             "Space",
             "Enter",
             "Tab",
@@ -17230,7 +19234,45 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "Ctrl",
             "Alt",
         ]
-        return named + letters + numbers + function_keys
+        modifiers_and_system = [
+            "Left Shift",
+            "Right Shift",
+            "Left Ctrl",
+            "Right Ctrl",
+            "Left Alt",
+            "Right Alt",
+            "Left Windows",
+            "Right Windows",
+            "Menu",
+            "Caps Lock",
+            "Num Lock",
+            "Scroll Lock",
+            "Print Screen",
+            "Pause",
+            "Break",
+        ]
+        numpad = [f"Numpad {i}" for i in range(10)] + [
+            "Numpad Multiply",
+            "Numpad Add",
+            "Numpad Subtract",
+            "Numpad Divide",
+            "Numpad Period",
+            "Numpad Enter",
+        ]
+        punctuation = [
+            "Backtick (`)",
+            "Minus (-)",
+            "Equals (=)",
+            "Left Bracket ([)",
+            "Right Bracket (])",
+            "Backslash (\\)",
+            "Semicolon (;)",
+            "Apostrophe (')",
+            "Comma (,)",
+            "Period (.)",
+            "Slash (/)",
+        ]
+        return common + modifiers_and_system + numpad + punctuation + letters + numbers + function_keys
 
     def _auto_item_default_key_hold_s(self) -> float:
         return 0.05
@@ -17420,6 +19462,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 "condition_type",
                 "condition_point",
                 "conditional_point",
+                "condition_color_checks",
+                "color_checks",
                 "ocr_text",
                 "target_text",
                 "ocr_roi",
@@ -17436,6 +19480,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                     "match_mode": raw.get("match_mode", raw.get("ocr_match_mode", "contains")),
                     "case_sensitive": raw.get("case_sensitive", False),
                 }
+                if "condition_color_checks" in raw or "color_checks" in raw:
+                    condition_raw["color_checks"] = raw.get("condition_color_checks", raw.get("color_checks"))
             condition = self._normalize_auto_item_condition(
                 condition_raw,
                 fallback_enabled=(action_type == "if"),
@@ -19071,47 +21117,196 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
             color_group = QGroupBox("Color Conditional")
             color_layout = QVBoxLayout(color_group)
-            color_hint = QLabel("Sample one pixel at the condition point and compare it to the expected color.")
+            color_hint = QLabel(
+                "Add one or more point/color pairs. Every configured pair must match for this condition to pass."
+            )
             color_hint.setProperty("role", "hint")
             color_hint.setWordWrap(True)
             color_layout.addWidget(color_hint)
-            color_form = QFormLayout()
-            cond_point_le = QLineEdit(_point_text(condition.get("point") if isinstance(condition.get("point"), dict) else None))
-            cond_point_le.setPlaceholderText("x, y (0.0-1.0)")
-            cond_point_le.setToolTip("Client-relative conditional point. Enter as x, y values from 0.0 to 1.0, or use Capture Condition Point.")
-            cond_capture_btn = QPushButton("Capture Condition Point")
-            cond_capture_btn.setStyleSheet(self._get_secondary_button_style())
 
-            def _capture_condition_point() -> None:
+            color_check_table = QTableWidget()
+            color_check_table.setColumnCount(4)
+            color_check_table.setHorizontalHeaderLabels(["Point (x, y)", "Expected Color", "Tolerance", ""])
+            color_check_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+            color_check_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+            color_check_table.setShowGrid(False)
+            color_check_table.setAlternatingRowColors(True)
+            color_check_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            color_check_vertical_header = color_check_table.verticalHeader()
+            color_check_vertical_header.setVisible(False)
+            color_check_vertical_header.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+            color_check_vertical_header.setDefaultSectionSize(42)
+            color_check_header = color_check_table.horizontalHeader()
+            color_check_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+            color_check_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+            color_check_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+            color_check_header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+            color_check_table.setStyleSheet(
+                f"""
+                QTableWidget {{
+                    background-color: {ModernStyle.SURFACE};
+                    alternate-background-color: {ModernStyle.SURFACE_VARIANT};
+                    color: {ModernStyle.TEXT_PRIMARY};
+                    border: 1px solid {ModernStyle.BORDER};
+                    border-radius: 8px;
+                    gridline-color: transparent;
+                    outline: none;
+                }}
+                QTableWidget::item {{
+                    border-bottom: 1px solid {ModernStyle.BORDER};
+                    padding: 0px;
+                }}
+                QTableWidget::item:selected {{
+                    background-color: {ModernStyle.PRIMARY_VARIANT};
+                    color: {ModernStyle.TEXT_PRIMARY};
+                }}
+                QHeaderView::section {{
+                    background-color: {ModernStyle.SURFACE_VARIANT};
+                    color: {ModernStyle.TEXT_PRIMARY};
+                    border: none;
+                    border-bottom: 1px solid {ModernStyle.BORDER};
+                    padding: 7px 8px;
+                    font-weight: 600;
+                }}
+                QLineEdit, QSpinBox {{
+                    background-color: {ModernStyle.BACKGROUND};
+                    color: {ModernStyle.TEXT_PRIMARY};
+                    border: 1px solid {ModernStyle.BORDER};
+                    border-radius: 5px;
+                    padding: 4px 7px;
+                    margin: 4px;
+                    min-height: 22px;
+                    max-height: 24px;
+                }}
+                QLineEdit:focus, QSpinBox:focus {{
+                    border-color: {ModernStyle.PRIMARY};
+                }}
+                QPushButton {{
+                    background-color: {ModernStyle.SURFACE_VARIANT};
+                    color: {ModernStyle.TEXT_PRIMARY};
+                    border: 1px solid {ModernStyle.BORDER};
+                    border-radius: 5px;
+                    padding: 4px 8px;
+                    margin: 4px;
+                    min-width: 58px;
+                    max-width: 68px;
+                    min-height: 22px;
+                    max-height: 24px;
+                    font-size: 12px;
+                    font-weight: 500;
+                }}
+                QPushButton:hover {{
+                    border-color: {ModernStyle.PRIMARY};
+                    background-color: {ModernStyle.BORDER};
+                }}
+                """
+            )
+            color_layout.addWidget(color_check_table)
+
+            def _update_color_check_table_height() -> None:
+                visible_rows = max(1, min(4, color_check_table.rowCount()))
+                header_height = max(32, color_check_header.sizeHint().height())
+                color_check_table.setFixedHeight(header_height + (visible_rows * 42) + 3)
+
+            def _add_condition_color_check(spec: Optional[dict] = None) -> int:
+                normalized = self._normalize_auto_item_color_checks([spec]) if isinstance(spec, dict) else []
+                check = normalized[0] if normalized else {}
+                row_idx = color_check_table.rowCount()
+                color_check_table.insertRow(row_idx)
+
+                point_edit = QLineEdit(_point_text(check.get("point") if isinstance(check.get("point"), dict) else None))
+                point_edit.setPlaceholderText("x, y (0.0-1.0)")
+                point_edit.setToolTip("Client-relative point. Enter x, y values from 0.0 to 1.0, or capture it below.")
+                color_edit = QLineEdit(str(check.get("color") or "#FFFFFF"))
+                color_edit.setPlaceholderText("#FFFFFF")
+                tolerance_edit = QSpinBox()
+                tolerance_edit.setRange(0, 255)
+                tolerance_edit.setValue(int(check.get("tolerance", 10)))
+                remove_check_btn = QPushButton("Remove")
+                remove_check_btn.setToolTip("Remove this point/color pair")
+                remove_check_btn.clicked.connect(
+                    lambda _checked=False, button=remove_check_btn: _remove_condition_color_check_button(button)
+                )
+
+                color_check_table.setCellWidget(row_idx, 0, point_edit)
+                color_check_table.setCellWidget(row_idx, 1, color_edit)
+                color_check_table.setCellWidget(row_idx, 2, tolerance_edit)
+                color_check_table.setCellWidget(row_idx, 3, remove_check_btn)
+                _update_color_check_table_height()
+                return row_idx
+
+            def _remove_condition_color_check_button(button: QPushButton) -> None:
+                for row_idx in range(color_check_table.rowCount()):
+                    if color_check_table.cellWidget(row_idx, 3) is button:
+                        color_check_table.removeRow(row_idx)
+                        _update_color_check_table_height()
+                        return
+
+            def _read_condition_color_checks() -> List[dict]:
+                checks: List[dict] = []
+                for row_idx in range(color_check_table.rowCount()):
+                    point_edit = color_check_table.cellWidget(row_idx, 0)
+                    color_edit = color_check_table.cellWidget(row_idx, 1)
+                    tolerance_edit = color_check_table.cellWidget(row_idx, 2)
+                    if not isinstance(point_edit, QLineEdit):
+                        continue
+                    point_text = point_edit.text().strip()
+                    if not point_text:
+                        continue
+                    point = _point_from_text(f"Color pair {row_idx + 1} point", point_text)
+                    if point is None:
+                        continue
+                    color_value = color_edit.text().strip() if isinstance(color_edit, QLineEdit) else ""
+                    checks.append(
+                        {
+                            "point": point,
+                            "color": color_value or "#FFFFFF",
+                            "tolerance": int(tolerance_edit.value()) if isinstance(tolerance_edit, QSpinBox) else 10,
+                        }
+                    )
+                return checks
+
+            initial_color_checks = self._normalize_auto_item_color_checks(condition.get("color_checks") or [])
+            for check in initial_color_checks:
+                _add_condition_color_check(check)
+            if not initial_color_checks:
+                _add_condition_color_check()
+
+            color_check_btn_row = QHBoxLayout()
+            capture_color_check_btn = QPushButton("Capture Point + Color")
+            add_color_check_btn = QPushButton("Add Pair")
+            for btn in (capture_color_check_btn, add_color_check_btn):
+                btn.setStyleSheet(self._get_secondary_button_style())
+                color_check_btn_row.addWidget(btn)
+            color_check_btn_row.addStretch(1)
+            color_layout.addLayout(color_check_btn_row)
+
+            def _capture_condition_color_check() -> None:
                 result = self._capture_auto_item_point(sample_color=True)
-                if not result:
+                if not result or not isinstance(result.get("point"), dict):
                     return
-                point_val = result.get("point")
-                if isinstance(point_val, dict):
-                    condition["point"] = {
-                        "x": float(point_val.get("x", 0.0)),
-                        "y": float(point_val.get("y", 0.0)),
-                    }
-                    cond_point_le.setText(_point_text(condition["point"]))
-                if result.get("color"):
-                    color_le.setText(str(result.get("color") or "#FFFFFF"))
+                target_row = -1
+                for row_idx in range(color_check_table.rowCount()):
+                    point_edit = color_check_table.cellWidget(row_idx, 0)
+                    if isinstance(point_edit, QLineEdit) and not point_edit.text().strip():
+                        target_row = row_idx
+                        break
+                if target_row < 0:
+                    target_row = _add_condition_color_check()
+                point_edit = color_check_table.cellWidget(target_row, 0)
+                color_edit = color_check_table.cellWidget(target_row, 1)
+                if isinstance(point_edit, QLineEdit):
+                    point_edit.setText(_point_text(result["point"]))
+                if isinstance(color_edit, QLineEdit) and result.get("color"):
+                    color_edit.setText(str(result.get("color") or "#FFFFFF"))
+                color_check_table.setCurrentCell(target_row, 0)
 
-            cond_capture_btn.clicked.connect(_capture_condition_point)
-            cond_point_row = QWidget()
-            cond_point_lay = QHBoxLayout(cond_point_row)
-            cond_point_lay.setContentsMargins(0, 0, 0, 0)
-            cond_point_lay.setSpacing(8)
-            cond_point_lay.addWidget(cond_point_le, 1)
-            cond_point_lay.addWidget(cond_capture_btn)
-            color_form.addRow("Point:", cond_point_row)
-            color_le = QLineEdit(str(condition.get("color") or "#FFFFFF"))
-            color_le.setPlaceholderText("#FFFFFF")
-            color_form.addRow("Expected color:", color_le)
-            tolerance_spin = QSpinBox()
-            tolerance_spin.setRange(0, 255)
-            tolerance_spin.setValue(int(condition.get("tolerance", 10) or 10))
-            color_form.addRow("Tolerance:", tolerance_spin)
-            color_layout.addLayout(color_form)
+            def _add_blank_condition_color_check() -> None:
+                row_idx = _add_condition_color_check()
+                color_check_table.setCurrentCell(row_idx, 0)
+
+            capture_color_check_btn.clicked.connect(_capture_condition_color_check)
+            add_color_check_btn.clicked.connect(_add_blank_condition_color_check)
             cond_layout.addWidget(color_group)
 
             ocr_group = QGroupBox("OCR Conditional")
@@ -19301,9 +21496,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 "enable": cond_enable_chk,
                 "type": condition_type_combo,
                 "condition": condition,
-                "point_edit": cond_point_le,
-                "color": color_le,
-                "tolerance": tolerance_spin,
+                "color_check_reader": _read_condition_color_checks,
                 "ocr_text": ocr_text_le,
                 "match": match_combo,
                 "case": case_chk,
@@ -19314,6 +21507,21 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
 
         def _accept_action_step() -> None:
+            if condition_supported:
+                cond_enabled = bool(condition_widgets["enable"].isChecked()) or action_type == "if"
+                cond_type = str(condition_widgets["type"].currentData() or "color")
+                if cond_enabled and cond_type == "color":
+                    try:
+                        color_checks = condition_widgets["color_check_reader"]()
+                    except ValueError:
+                        return
+                    if not color_checks:
+                        QMessageBox.warning(
+                            dlg,
+                            "Color Pair Required",
+                            "Add or capture at least one point/color pair for the color conditional.",
+                        )
+                        return
             if action_type == "webhook":
                 if bool(webhook_screenshot_chk.isChecked()) and not _roi_text(webhook_screenshot_roi):
                     QMessageBox.warning(
@@ -19349,9 +21557,9 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             if action_type == "drag":
                 action_point = _point_from_text("Drag start point", start_point_le.text())
                 action_end_point = _point_from_text("Drag end point", end_point_le.text())
-            condition_point = None
-            if condition_supported and "point_edit" in condition_widgets:
-                condition_point = _point_from_text("Condition point", condition_widgets["point_edit"].text())
+            condition_color_checks = (
+                condition_widgets["color_check_reader"]() if condition_supported else []
+            )
         except ValueError:
             return None
 
@@ -19391,13 +21599,15 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             cond_source = copy.deepcopy(condition_widgets.get("condition") or {})
             cond_enabled = bool(condition_widgets["enable"].isChecked()) or action_type == "if"
             cond_type = str(condition_widgets["type"].currentData() or "color")
+            first_color_check = condition_color_checks[0] if condition_color_checks else {}
             out["condition"] = {
                 "enabled": cond_enabled,
                 "type": cond_type,
-                "point": condition_point,
+                "point": copy.deepcopy(first_color_check.get("point")) if isinstance(first_color_check.get("point"), dict) else None,
                 "roi": copy.deepcopy(cond_source.get("roi")) if isinstance(cond_source.get("roi"), dict) else self._ocr_empty_roi_cfg(),
-                "color": condition_widgets["color"].text().strip() or "#FFFFFF",
-                "tolerance": int(condition_widgets["tolerance"].value()),
+                "color": str(first_color_check.get("color") or "#FFFFFF"),
+                "tolerance": int(first_color_check.get("tolerance", 10)),
+                "color_checks": condition_color_checks,
                 "target_text": condition_widgets["ocr_text"].text().strip(),
                 "match_mode": str(condition_widgets["match"].currentData() or "contains"),
                 "case_sensitive": bool(condition_widgets["case"].isChecked()),
@@ -21040,19 +23250,30 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.auto_item_users_hint.setWordWrap(True)
         users_layout.addWidget(self.auto_item_users_hint)
 
-        self.auto_item_users_container = QWidget()
-        self.auto_item_users_vbox = QVBoxLayout(self.auto_item_users_container)
-        self.auto_item_users_vbox.setContentsMargins(0, 0, 0, 0)
-        self.auto_item_users_vbox.setSpacing(4)
+        self.auto_item_users_list = QListWidget()
+        self.auto_item_users_list.setAlternatingRowColors(False)
+        self.auto_item_users_list.setUniformItemSizes(True)
+        self.auto_item_users_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.auto_item_users_list.setStyleSheet(
+            f"""
+            QListWidget {{ background:{ModernStyle.SURFACE}; border:1px solid {ModernStyle.BORDER}; }}
+            QListWidget::item {{ padding:4px; color:{ModernStyle.TEXT_PRIMARY}; }}
+            QListWidget::indicator {{
+                width:18px; height:18px; border:2px solid {ModernStyle.BORDER};
+                border-radius:4px; background:{ModernStyle.SURFACE};
+            }}
+            QListWidget::indicator:checked {{
+                background:{ModernStyle.PRIMARY}; border-color:{ModernStyle.PRIMARY};
+            }}
+            """
+        )
+        self.auto_item_users_list.itemChanged.connect(self._on_auto_item_user_selection_changed)
         self.auto_item_user_checks = {}
         self._auto_item_user_list_initialized = False
 
-        users_scroll = QScrollArea()
-        users_scroll.setWidgetResizable(True)
-        users_scroll.setWidget(self.auto_item_users_container)
-        users_scroll.setMinimumHeight(180)
-        users_scroll.setMinimumWidth(280)
-        users_layout.addWidget(users_scroll)
+        self.auto_item_users_list.setMinimumHeight(180)
+        self.auto_item_users_list.setMinimumWidth(280)
+        users_layout.addWidget(self.auto_item_users_list)
 
         log_group = QGroupBox("Auto-Actions Log")
         log_layout = QVBoxLayout(log_group)
@@ -21109,20 +23330,9 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self._ensure_auto_item_engine()
         self._auto_item_users_refresh_timer.start()
 
-        self.tab_widget.addTab(scroll, "Auto Actions")
+        self.auto_item_tab_index = self.tab_widget.addTab(scroll, "Auto Actions")
 
     def _open_auto_item_monitor(self) -> None:
-        self._ensure_auto_item_engine()
-        engine = getattr(self, "auto_item_engine", None)
-        if engine is None or not hasattr(engine, "monitor_snapshot"):
-            QMessageBox.warning(self, "Auto Actions Monitor", "The Auto Actions engine is not available.")
-            return
-
-        try:
-            engine.update_config(self._get_auto_item_settings_from_ui())
-        except Exception:
-            pass
-
         existing = getattr(self, "_auto_item_monitor_dialog", None)
         if existing is not None:
             try:
@@ -21133,6 +23343,19 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                     return
             except RuntimeError:
                 pass
+
+        engine = getattr(self, "auto_item_engine", None)
+        if engine is None:
+            self._ensure_auto_item_engine()
+            engine = getattr(self, "auto_item_engine", None)
+        elif not engine.is_running():
+            try:
+                engine.start()
+            except Exception:
+                pass
+        if engine is None or not hasattr(engine, "monitor_snapshot"):
+            QMessageBox.warning(self, "Auto Actions Monitor", "The Auto Actions engine is not available.")
+            return
 
         dialog = _AutoActionsMonitorDialog(engine.monitor_snapshot, self)
         self._auto_item_monitor_dialog = dialog
@@ -21927,7 +24150,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             msg.setStyleSheet(f"color: {ModernStyle.TEXT_SECONDARY};")
             layout.addWidget(msg)
             layout.addStretch(1)
-            self.tab_widget.addTab(bes_widget, "BES")
+            self.bes_tab_index = self.tab_widget.addTab(bes_widget, "BES")
             return
 
         top_group = QGroupBox("BES - Battle Encoder Shirase")
@@ -22053,7 +24276,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(bes_widget)
-        self.tab_widget.addTab(scroll, "BES")
+        self.bes_tab_index = self.tab_widget.addTab(scroll, "BES")
 
         # Debounced persistence (avoid writing settings.json on slider drag)
         self._bes_save_timer = QTimer(self)
@@ -22181,7 +24404,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             pass
         self._on_bes_ui_changed()
 
-    def _on_bes_enabled_toggled(self, enabled: bool) -> None:
+    def _on_bes_enabled_toggled(self, enabled: bool, *, persist: bool = True) -> None:
         if self.bes_controller is None:
             self._bes_update_status("Status: Unsupported", warning=True)
             return
@@ -22196,7 +24419,15 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             try:
                 chk = getattr(self, "antiafk_unthrottle_chk", None)
                 if chk is not None and not chk.isChecked():
-                    chk.setChecked(True)
+                    if persist:
+                        chk.setChecked(True)
+                    else:
+                        previous_loading = bool(getattr(self, "_loading_antiafk_settings", False))
+                        self._loading_antiafk_settings = True
+                        try:
+                            chk.setChecked(True)
+                        finally:
+                            self._loading_antiafk_settings = previous_loading
             except Exception:
                 pass
             try:
@@ -22219,11 +24450,12 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         except Exception:
             pass
 
-        self._on_bes_ui_changed()
-        try:
-            self._on_antiafk_ui_changed()
-        except Exception:
-            pass
+        if persist:
+            self._on_bes_ui_changed()
+            try:
+                self._on_antiafk_ui_changed()
+            except Exception:
+                pass
 
     def _normalize_bes_cfg(self, cfg: Optional[Dict]) -> Dict:
         cfg = dict(cfg or {})
@@ -22347,7 +24579,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
         # Apply enabled state on load (starts/stops controller/timer)
         try:
-            self._on_bes_enabled_toggled(bool(self.bes_enable_chk.isChecked()))
+            self._on_bes_enabled_toggled(bool(self.bes_enable_chk.isChecked()), persist=False)
         except Exception:
             pass
 
@@ -24702,6 +26934,11 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             "workers": self.ocr_workers_spin.value(),
             "max_captures_per_second": self.ocr_max_caps_spin.value(),
             "batch_delay_seconds": float(self.ocr_batch_delay_spin.value()),
+            "processing_mode": (
+                self.ocr_processing_mode_combo.currentData()
+                if hasattr(self, "ocr_processing_mode_combo")
+                else "separate"
+            ),
             "use_preprocess": bool(self.ocr_preprocess_chk.isChecked()),
             "frame_diff_tolerance": int(self.ocr_frame_diff_tol_spin.value()),
             "log_ocr_text": bool(getattr(self, "ocr_log_text_chk", None) and self.ocr_log_text_chk.isChecked()),
@@ -24724,6 +26961,13 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             self.ocr_workers_spin.setValue(int(cfg.get("workers", defaults.get("workers", 1))))
             self.ocr_max_caps_spin.setValue(int(cfg.get("max_captures_per_second", defaults.get("max_captures_per_second", 20))))
             self.ocr_batch_delay_spin.setValue(float(cfg.get("batch_delay_seconds", defaults.get("batch_delay_seconds", 1.0))))
+            processing_mode = str(
+                cfg.get("processing_mode", defaults.get("processing_mode", "separate")) or "separate"
+            ).strip().lower()
+            processing_index = self.ocr_processing_mode_combo.findData(
+                "combined" if processing_mode in {"combined", "combined_batch", "batch", "tiled"} else "separate"
+            )
+            self.ocr_processing_mode_combo.setCurrentIndex(max(0, processing_index))
             self.ocr_preprocess_chk.setChecked(bool(cfg.get("use_preprocess", defaults.get("use_preprocess", True))))
             self.ocr_frame_diff_tol_spin.setValue(int(cfg.get("frame_diff_tolerance", defaults.get("frame_diff_tolerance", 2))))
             if hasattr(self, "ocr_log_text_chk"):
@@ -24922,6 +27166,11 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             self.ocr_workers_spin.setValue(int(defaults.get("workers", 1)))
             self.ocr_max_caps_spin.setValue(int(defaults.get("max_captures_per_second", 20)))
             self.ocr_batch_delay_spin.setValue(float(defaults.get("batch_delay_seconds", 1.0)))
+            processing_mode = str(defaults.get("processing_mode", "separate") or "separate").strip().lower()
+            processing_index = self.ocr_processing_mode_combo.findData(
+                "combined" if processing_mode in {"combined", "combined_batch", "batch", "tiled"} else "separate"
+            )
+            self.ocr_processing_mode_combo.setCurrentIndex(max(0, processing_index))
             self.ocr_preprocess_chk.setChecked(bool(defaults.get("use_preprocess", True)))
             self.ocr_frame_diff_tol_spin.setValue(int(defaults.get("frame_diff_tolerance", 2)))
             if hasattr(self, "ocr_log_text_chk"):
@@ -25570,7 +27819,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         current_priorities = self._collect_launch_priorities_from_ui()
         if not isinstance(users_config, dict):
             try:
-                users_config = self.config_manager.load_users() or {}
+                users_config = self.config_manager.peek_users() or {}
             except Exception:
                 users_config = {}
         if not isinstance(users_config, dict):
@@ -25583,7 +27832,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             query = ""
 
         rows = [
-            (str(uid), info)
+            (str(uid), dict(info))
             for uid, info in (users_config or {}).items()
             if isinstance(info, dict)
             and (
@@ -25609,14 +27858,22 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             status_segments = self._launch_priority_status_segments(info)
             status_item = QTableWidgetItem(" / ".join(status_segments))
             status_item.setData(_LAUNCH_PRIORITY_STATUS_ROLE, status_segments)
-            priority_spin = self._make_launch_priority_spin(info.get("launch_priority", DEFAULT_LAUNCH_PRIORITY))
+            priority_item = QTableWidgetItem()
+            priority_item.setData(
+                Qt.ItemDataRole.EditRole,
+                coerce_launch_priority(info.get("launch_priority", DEFAULT_LAUNCH_PRIORITY)),
+            )
+            priority_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            priority_item.setToolTip(
+                "Higher numbers launch first. Range: -3 to +3. Accounts with the same priority keep this table order."
+            )
 
             for item in (uid_item, username_item, status_item):
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
 
             table.setItem(row, 0, uid_item)
             table.setItem(row, 1, username_item)
-            table.setCellWidget(row, 2, priority_spin)
+            table.setItem(row, 2, priority_item)
             table.setItem(row, 3, status_item)
             try:
                 table.setRowHeight(row, 44)
@@ -25630,7 +27887,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
     def _collect_launch_priorities_from_ui(self) -> dict:
         try:
-            users_config = self.config_manager.load_users() or {}
+            users_config = self.config_manager.peek_users() or {}
         except Exception:
             users_config = {}
         priorities = {
@@ -25652,7 +27909,10 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             if isinstance(spin, QSpinBox):
                 priorities[uid] = coerce_launch_priority(spin.value())
             else:
-                priorities[uid] = DEFAULT_LAUNCH_PRIORITY
+                priority_item = table.item(row, 2)
+                priorities[uid] = coerce_launch_priority(
+                    priority_item.data(Qt.ItemDataRole.EditRole) if priority_item is not None else DEFAULT_LAUNCH_PRIORITY
+                )
         return priorities
 
     def _reset_launch_priorities_ui(self) -> None:
@@ -25663,6 +27923,10 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             spin = self._launch_priority_spin_at_row(table, row)
             if isinstance(spin, QSpinBox):
                 spin.setValue(DEFAULT_LAUNCH_PRIORITY)
+            else:
+                item = table.item(row, 2)
+                if item is not None:
+                    item.setData(Qt.ItemDataRole.EditRole, DEFAULT_LAUNCH_PRIORITY)
 
     def _save_launch_priorities_from_ui(self) -> bool:
         priorities = self._collect_launch_priorities_from_ui()
@@ -26002,7 +28266,13 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             self.launch_priority_search_input.setClearButtonEnabled(True)
         except Exception:
             pass
-        self.launch_priority_search_input.textChanged.connect(lambda _text: self._populate_launch_priority_table())
+        self._launch_priority_search_timer = QTimer(self)
+        self._launch_priority_search_timer.setSingleShot(True)
+        self._launch_priority_search_timer.setInterval(180)
+        self._launch_priority_search_timer.timeout.connect(self._populate_launch_priority_table)
+        self.launch_priority_search_input.textChanged.connect(
+            lambda _text: self._launch_priority_search_timer.start()
+        )
         launch_priority_layout.addWidget(self.launch_priority_search_input)
 
         self.launch_priority_table = QTableWidget()
@@ -26052,7 +28322,13 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.launch_priority_table.setHorizontalHeaderLabels(["User ID", "Username", "Priority", "Status"])
         self.launch_priority_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.launch_priority_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.launch_priority_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.launch_priority_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.DoubleClicked
+            | QAbstractItemView.EditTrigger.SelectedClicked
+            | QAbstractItemView.EditTrigger.EditKeyPressed
+        )
+        self._launch_priority_delegate = _LaunchPriorityDelegate(self.launch_priority_table)
+        self.launch_priority_table.setItemDelegateForColumn(2, self._launch_priority_delegate)
         self._launch_priority_status_delegate = _LaunchPriorityStatusDelegate(self.launch_priority_table)
         self.launch_priority_table.setItemDelegateForColumn(3, self._launch_priority_status_delegate)
         priority_row_height = 44
@@ -26071,11 +28347,13 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             priority_min_height = 260
         self.launch_priority_table.setMinimumHeight(priority_min_height)
         priority_header = self.launch_priority_table.horizontalHeader()
-        priority_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        priority_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        self.launch_priority_table.setColumnWidth(0, 115)
         priority_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         priority_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
         self.launch_priority_table.setColumnWidth(2, 132)
-        priority_header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        priority_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        self.launch_priority_table.setColumnWidth(3, 180)
         launch_priority_layout.addWidget(self.launch_priority_table)
 
         launch_priority_buttons = QHBoxLayout()
@@ -29289,6 +31567,10 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
         resume_state = copy.deepcopy(resume_state)
         try:
+            self.merchant_fix_controller.attach_manager_resume_state(resume_state)
+        except Exception:
+            pass
+        try:
             self._attach_bes_log_confirmations_to_resume_state(resume_state)
         except Exception:
             pass
@@ -29352,6 +31634,12 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
         self._paused_worker_state = copy.deepcopy(resume_state)
         try:
+            self.merchant_fix_controller.import_manager_resume_state(
+                self._paused_worker_state
+            )
+        except Exception as exc:
+            self.add_log(f"[Merchant Fix] Could not import paused Smart state: {exc}")
+        try:
             self._restore_bes_log_confirmations_from_resume_state(
                 self._paused_worker_state
             )
@@ -29413,6 +31701,13 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         return False
 
     def start_manager(self):
+        if bool(getattr(self, "_merchant_fix_pending", False)):
+            QMessageBox.warning(
+                self,
+                "Merchant Fix Is Busy",
+                "Wait for the current Merchant Fix operation to finish before starting the manager.",
+            )
+            return
         if bool(getattr(self, "_multi_instance_enabled", False)) and not bool(
             getattr(self, "_multi_instance_guard_active", False)
         ):
@@ -29424,6 +31719,24 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             return
         if self.worker_thread and self.worker_thread.isRunning():
             return
+        if bool(self.merchant_fix_controller.smart_enabled):
+            try:
+                if is_classic_block_active():
+                    raise RuntimeError(
+                        "Both Smart mode and the Classic global block are configured. Open "
+                        "Extras → Merchant Fix and disable one mode."
+                    )
+                if not self.merchant_fix_controller.helper_connected:
+                    self.merchant_fix_controller.activate_smart()
+            except Exception as exc:
+                QMessageBox.warning(
+                    self,
+                    "Smart Merchant Fix Unavailable",
+                    "The manager was not started because Smart Merchant Fix could not obtain "
+                    f"administrator access or initialize its blocker.\n\n{exc}",
+                )
+                self.add_log(f"[Merchant Fix] Smart startup check failed: {exc}")
+                return
         if self._settings_prompt_ready and self.settings_tab_index is not None:
             if self.tab_widget.currentIndex() == self.settings_tab_index:
                 changes = self._get_settings_changes()
@@ -29638,6 +31951,12 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self._paused_at = time.time()
 
         if self._paused_worker_state:
+            try:
+                self.merchant_fix_controller.attach_manager_resume_state(
+                    self._paused_worker_state, detached=False
+                )
+            except Exception as exc:
+                self.add_log(f"[Merchant Fix] Could not snapshot Smart pause state: {exc}")
             if not self._persist_paused_manager_state():
                 self.add_log("[UI] Failed to save paused manager state to disk; closing now will lose the resume snapshot.")
         else:
@@ -29674,6 +31993,20 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         except Exception:
             pass
 
+    def _on_late_merchant_fix_handoff(self, restored_blocks: int) -> None:
+        """Finalize a takeover that occurred after this manager already resumed."""
+        count = max(0, int(restored_blocks))
+        self._clear_persisted_paused_manager_state()
+        self.add_log(
+            f"[Merchant Fix] Completed late handoff for {count} Smart PID "
+            f"block{'s' if count != 1 else ''}; the original helper can now close."
+        )
+
+        # The original window persists a fallback snapshot while closing if it
+        # has not observed our acknowledgement yet. Clear that possible late
+        # write once more after the cross-process close path has finished.
+        QTimer.singleShot(1000, self._clear_persisted_paused_manager_state)
+
     def resume_manager(self):
         if bool(getattr(self, "_multi_instance_enabled", False)) and not bool(
             getattr(self, "_multi_instance_guard_active", False)
@@ -29687,6 +32020,25 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             return
 
         resume_state = self._paused_worker_state
+
+        try:
+            restored_blocks = self.merchant_fix_controller.adopt_manager_resume_state(
+                resume_state
+            )
+            if restored_blocks:
+                self.add_log(
+                    f"[Merchant Fix] Preserved {restored_blocks} Smart PID block(s) "
+                    "across the manager resume."
+                )
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "Smart Merchant Fix Resume Failed",
+                "The manager was not resumed because its Smart PID blocks could not "
+                f"be transferred safely.\n\n{exc}",
+            )
+            self.add_log(f"[Merchant Fix] Smart pause handoff failed: {exc}")
+            return
 
         try:
             self._attach_bes_log_confirmations_to_resume_state(resume_state)
@@ -29746,19 +32098,32 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.status_label.setStyleSheet(f"color: {ModernStyle.WARNING}; font-weight: bold;")
 
     def update_ui(self):
-        active_users = sum(1 for data in self.user_data.values() if data.get('status') == 'Active')
-        total_processes = sum(len(data.get('pids', [])) for data in self.user_data.values())
-        pending_restarts = sum(1 for data in self.user_data.values() if data.get('needs_restart', False))
+        active_users, total_processes, pending_restarts = self._dashboard_runtime_summary
         users_cfg = self.config_manager.peek_users()
         try:
-            good_count = sum(1 for i in users_cfg.values() if not (i.get("bad") or i.get("cap")) and not i.get("disabled"))
+            config_signature = self.config_manager.get_users_runtime_signature()
+            if config_signature != self._dashboard_good_count_signature:
+                self._dashboard_good_count_signature = config_signature
+                self._dashboard_good_count = sum(
+                    1
+                    for info in users_cfg.values()
+                    if isinstance(info, dict)
+                    and not (info.get("bad") or info.get("cap"))
+                    and not info.get("disabled")
+                )
+            good_count = self._dashboard_good_count
         except Exception:
             good_count = 0
 
-        self.total_users_label.setText(str(good_count))
-        self.active_users_label.setText(str(active_users))
-        self.total_processes_label.setText(str(total_processes))
-        self.pending_restarts_label.setText(str(pending_restarts))
+        for label, value in (
+            (self.total_users_label, good_count),
+            (self.active_users_label, active_users),
+            (self.total_processes_label, total_processes),
+            (self.pending_restarts_label, pending_restarts),
+        ):
+            text = str(value)
+            if label.text() != text:
+                label.setText(text)
         self._maybe_send_hourly_users_report(good_count, active_users)
         try:
             if self.users_tab_index is not None and self.tab_widget.currentIndex() == self.users_tab_index:
@@ -29832,7 +32197,20 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             pass
 
     def update_user_status(self, status_data):
-        self.user_data = status_data
+        incoming = status_data if isinstance(status_data, dict) else {}
+        previous = self.user_data if isinstance(self.user_data, dict) else {}
+        changed_uids = {
+            str(uid)
+            for uid in (set(previous) | set(incoming))
+            if previous.get(uid) != incoming.get(uid)
+        }
+        self._users_table_dirty_uids.update(changed_uids)
+        self.user_data = incoming
+        self._dashboard_runtime_summary = (
+            sum(1 for data in incoming.values() if isinstance(data, dict) and data.get("status") == "Active"),
+            sum(len(data.get("pids", []) or []) for data in incoming.values() if isinstance(data, dict)),
+            sum(1 for data in incoming.values() if isinstance(data, dict) and data.get("needs_restart", False)),
+        )
         try:
             self._sync_antiafk_touch_state_from_user_data()
         except Exception:
@@ -29840,6 +32218,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self._schedule_users_table_refresh()
 
     def update_process_data(self, process_data):
+        if process_data == self.process_data:
+            return
         self.process_data = process_data
         try:
             if self.users_tab_index is not None and self.tab_widget.currentIndex() == self.users_tab_index:
@@ -29965,12 +32345,61 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                     disconnected_pids.update(pid_list)
 
         pids_to_touch: List[int] = []
+        resolved_pending_by_uid: Dict[str, float] = {}
         with self._antiafk_touch_lock:
             self._antiafk_pid_to_uid = new_pid_to_uid
 
             for uid_s in disconnected_uids:
                 self._antiafk_last_touch_by_uid.pop(uid_s, None)
                 self._antiafk_last_action_by_uid.pop(uid_s, None)
+
+            # Reconcile successful native actions that arrived just before the
+            # manager published ownership for a new/replaced PID. Previously
+            # those callbacks were discarded, so an old per-user timestamp
+            # could remain overdue indefinitely despite a completed action.
+            pending_touches = getattr(self, "_antiafk_pending_touch_by_pid", None)
+            if pending_touches is None:
+                pending_touches = {}
+                self._antiafk_pending_touch_by_pid = pending_touches
+            touches_by_pid = getattr(self, "_antiafk_last_touch_by_pid", None)
+            if touches_by_pid is None:
+                touches_by_pid = dict(pending_touches)
+                self._antiafk_last_touch_by_pid = touches_by_pid
+            for pid_i, touch_ts in list(touches_by_pid.items()):
+                try:
+                    touch_ts_f = min(float(touch_ts), now_ts)
+                except Exception:
+                    pending_touches.pop(pid_i, None)
+                    touches_by_pid.pop(pid_i, None)
+                    continue
+                uid_s = str(new_pid_to_uid.get(int(pid_i)) or "").strip()
+                if not uid_s:
+                    # Bound unmatched events in case a third-party Roblox
+                    # window was never owned by this manager.
+                    if touch_ts_f <= 0.0 or (now_ts - touch_ts_f) > 3600.0:
+                        pending_touches.pop(pid_i, None)
+                        touches_by_pid.pop(pid_i, None)
+                    continue
+                pending_touches.pop(pid_i, None)
+                if uid_s in disconnected_uids or touch_ts_f <= 0.0:
+                    touches_by_pid.pop(pid_i, None)
+                    continue
+                previous_action_ts = float(
+                    self._antiafk_last_action_by_uid.get(uid_s, 0.0) or 0.0
+                )
+                self._antiafk_last_touch_by_uid[uid_s] = max(
+                    float(self._antiafk_last_touch_by_uid.get(uid_s, 0.0) or 0.0),
+                    touch_ts_f,
+                )
+                self._antiafk_last_action_by_uid[uid_s] = max(
+                    float(self._antiafk_last_action_by_uid.get(uid_s, 0.0) or 0.0),
+                    touch_ts_f,
+                )
+                if touch_ts_f > previous_action_ts:
+                    resolved_pending_by_uid[uid_s] = max(
+                        float(resolved_pending_by_uid.get(uid_s, 0.0) or 0.0),
+                        touch_ts_f,
+                    )
 
             for uid_s, pid_list in pids_by_uid.items():
                 if uid_s in disconnected_uids:
@@ -29988,6 +32417,16 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
             old_disconnected = set(self._antiafk_disconnected_pids)
             self._antiafk_disconnected_pids = set(disconnected_pids)
+
+        if resolved_pending_by_uid:
+            try:
+                wt = getattr(self, "worker_thread", None)
+                record_touch = getattr(wt, "record_antiafk_action", None)
+                if callable(record_touch):
+                    for uid_s, touch_ts in resolved_pending_by_uid.items():
+                        record_touch(uid_s, touch_ts)
+            except Exception:
+                pass
 
         antiafk = getattr(self, "antiafk", None)
         if antiafk is not None:
@@ -30065,9 +32504,204 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 if item.text() != s:
                     item.setText(s)
             if fg is not None:
-                item.setForeground(fg)
+                try:
+                    current_fg = item.foreground().color()
+                except Exception:
+                    current_fg = None
+                if current_fg != fg:
+                    item.setForeground(fg)
         except Exception:
             return
+
+    def _set_table_actions(
+        self,
+        table: QTableWidget,
+        row: int,
+        col: int,
+        uid: str,
+        actions: Sequence[Tuple[str, str, str]],
+        *,
+        tooltip: str = "",
+    ) -> None:
+        """Store lightweight action metadata for _TableActionDelegate."""
+        try:
+            item = table.item(row, col)
+            if item is None:
+                item = QTableWidgetItem("")
+                table.setItem(row, col, item)
+            item.setData(_TABLE_ACTION_UID_ROLE, str(uid))
+            item.setData(_TABLE_ACTIONS_ROLE, tuple(tuple(action) for action in actions))
+            if item.toolTip() != tooltip:
+                item.setToolTip(tooltip)
+        except Exception:
+            return
+
+    def _connect_virtual_table_actions(self, table: QTableWidget) -> None:
+        """Refresh real action buttons only when a table's viewport changes."""
+        try:
+            for scrollbar in (table.verticalScrollBar(), table.horizontalScrollBar()):
+                scrollbar.valueChanged.connect(self._schedule_visible_table_action_widgets)
+                scrollbar.rangeChanged.connect(self._schedule_visible_table_action_widgets)
+        except Exception:
+            pass
+
+    def _schedule_visible_table_action_widgets(self, *_args) -> None:
+        if bool(getattr(self, "_visible_table_actions_pending", False)):
+            return
+        self._visible_table_actions_pending = True
+        QTimer.singleShot(0, self._sync_visible_table_action_widgets)
+
+    @staticmethod
+    def _visible_table_action_cells(
+        table: QTableWidget,
+        columns: Sequence[int],
+    ) -> Set[Tuple[int, int]]:
+        try:
+            if not table.isVisible() or table.rowCount() <= 0:
+                return set()
+            viewport_rect = table.viewport().rect()
+            if viewport_rect.isEmpty():
+                return set()
+            first_row = table.rowAt(0)
+            if first_row < 0:
+                return set()
+            last_row = table.rowAt(max(0, viewport_rect.height() - 1))
+            if last_row < 0:
+                last_row = table.rowCount() - 1
+
+            visible: Set[Tuple[int, int]] = set()
+            model = table.model()
+            for row in range(first_row, min(last_row + 1, table.rowCount())):
+                for column in columns:
+                    if table.isColumnHidden(column):
+                        continue
+                    rect = table.visualRect(model.index(row, column))
+                    if rect.isValid() and rect.intersects(viewport_rect):
+                        visible.add((row, int(column)))
+            return visible
+        except (RuntimeError, AttributeError):
+            return set()
+
+    @staticmethod
+    def _remove_table_action_widget(table: QTableWidget, row: int, column: int) -> None:
+        try:
+            widget = table.cellWidget(row, column)
+            if widget is None:
+                return
+            widget.hide()
+            table.removeCellWidget(row, column)
+            widget.deleteLater()
+        except (RuntimeError, AttributeError):
+            return
+
+    def _clear_virtual_table_actions(
+        self,
+        table: QTableWidget,
+        cells_attr: str,
+    ) -> None:
+        cells = set(getattr(self, cells_attr, set()) or set())
+        for row, column in cells:
+            self._remove_table_action_widget(table, row, column)
+        setattr(self, cells_attr, set())
+
+    def _create_users_action_widget(self, uid: str, _column: int) -> QWidget:
+        actions_widget = QWidget()
+        actions_layout = QHBoxLayout(actions_widget)
+        actions_layout.setContentsMargins(6, 4, 6, 4)
+        actions_layout.setSpacing(6)
+        actions_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        restart_btn = QPushButton("Restart")
+        restart_btn.clicked.connect(lambda _checked=False, user_id=uid: self.restart_user_session(user_id))
+        actions_layout.addWidget(restart_btn)
+
+        kill_btn = QPushButton("Kill")
+        kill_btn.setProperty("class", "danger")
+        kill_btn.clicked.connect(lambda _checked=False, user_id=uid: self.kill_user_processes(user_id))
+        actions_layout.addWidget(kill_btn)
+        return actions_widget
+
+    def _create_accounts_action_widget(self, uid: str, column: int) -> QPushButton:
+        if column == 4:
+            button = QPushButton("Edit")
+            button.setStyleSheet(
+                "QPushButton {background-color:%s; color:white; border:none; padding:2px 4px; "
+                "border-radius:3px; font-size:8px; font-weight:bold; min-width:50px; "
+                "max-width:80px; min-height:18px; max-height:22px;} "
+                "QPushButton:hover {background-color:%s;}"
+                % (ModernStyle.PRIMARY, ModernStyle.PRIMARY_VARIANT)
+            )
+            button.clicked.connect(lambda _checked=False, user_id=uid: self.edit_account(user_id))
+            return button
+
+        button = QPushButton("Del")
+        button.setStyleSheet(
+            "QPushButton {background-color:#f44336; color:white; border:none; padding:2px 4px; "
+            "border-radius:3px; font-size:8px; font-weight:bold; min-width:40px; "
+            "max-width:70px; min-height:18px; max-height:22px;} "
+            "QPushButton:hover {background-color:#da190b;}"
+        )
+        button.clicked.connect(lambda _checked=False, user_id=uid: self.delete_account(user_id))
+        return button
+
+    def _sync_one_virtual_action_table(
+        self,
+        table: QTableWidget,
+        columns: Sequence[int],
+        cells_attr: str,
+        widget_factory,
+    ) -> None:
+        desired = self._visible_table_action_cells(table, columns)
+        current = set(getattr(self, cells_attr, set()) or set())
+
+        for row, column in current - desired:
+            self._remove_table_action_widget(table, row, column)
+
+        loaded: Set[Tuple[int, int]] = set()
+        for row, column in sorted(desired):
+            try:
+                widget = table.cellWidget(row, column)
+                if widget is None:
+                    uid_item = table.item(row, 0)
+                    uid = str(uid_item.text() if uid_item is not None else "").strip()
+                    if not uid:
+                        continue
+                    widget = widget_factory(uid, column)
+                    table.setCellWidget(row, column, widget)
+                loaded.add((row, column))
+            except (RuntimeError, AttributeError):
+                continue
+        setattr(self, cells_attr, loaded)
+
+    def _sync_visible_table_action_widgets(self) -> None:
+        self._visible_table_actions_pending = False
+        users_table = getattr(self, "users_table", None)
+        if users_table is not None:
+            self._sync_one_virtual_action_table(
+                users_table,
+                (12,),
+                "_users_action_widget_cells",
+                self._create_users_action_widget,
+            )
+        accounts_table = getattr(self, "accounts_list", None)
+        if accounts_table is not None:
+            self._sync_one_virtual_action_table(
+                accounts_table,
+                (4, 5),
+                "_accounts_action_widget_cells",
+                self._create_accounts_action_widget,
+            )
+
+    def _handle_table_action(self, uid: str, action: str) -> None:
+        action = str(action or "").strip().lower()
+        if action == "restart":
+            self.restart_user_session(uid)
+        elif action == "kill":
+            self.kill_user_processes(uid)
+        elif action == "edit":
+            self.edit_account(uid)
+        elif action == "delete":
+            self.delete_account(uid)
 
     def refresh_users(self, *_args, force_full: bool = False):
         table = getattr(self, "users_table", None)
@@ -30077,6 +32711,13 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         users_cfg = self.config_manager.peek_users() or {}
         if not isinstance(users_cfg, dict):
             users_cfg = {}
+        try:
+            config_signature = self.config_manager.get_users_runtime_signature()
+        except Exception:
+            config_signature = None
+        config_changed = config_signature != getattr(self, "_users_table_config_signature", None)
+        if config_changed:
+            self._users_table_config_signature = config_signature
 
         try:
             def _uid_sort_key(value: object) -> tuple:
@@ -30107,13 +32748,22 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             row_count_changed = True
 
         order_changed = ordered_uids != (self._users_table_order or [])
-        rebuild = bool(force_full) or bool(order_changed) or bool(row_count_changed)
-        rebuild_widgets = bool(order_changed) or bool(row_count_changed)
+        rebuild = bool(force_full) or bool(order_changed) or bool(row_count_changed) or bool(config_changed)
+        rebuild_actions = bool(order_changed) or bool(row_count_changed)
 
-        try:
-            table.setUpdatesEnabled(False)
-        except Exception:
-            pass
+        if rebuild_actions:
+            try:
+                self._clear_virtual_table_actions(table, "_users_action_widget_cells")
+            except Exception:
+                pass
+
+        updates_suspended = False
+        if rebuild:
+            try:
+                table.setUpdatesEnabled(False)
+                updates_suspended = True
+            except Exception:
+                pass
 
         try:
             if rebuild:
@@ -30130,6 +32780,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             for row, (user_id, runtime) in enumerate(ordered):
                 uid = str(user_id)
                 runtime = runtime or {}
+                if not rebuild and uid not in (getattr(self, "_users_table_dirty_uids", set()) or set()):
+                    continue
 
                 u_conf = users_cfg.get(uid, {}) or {}
                 if not isinstance(u_conf, dict):
@@ -30226,33 +32878,31 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                         age_text = "N/A"
                     self._set_users_table_item(row, 11, age_text)
 
-                try:
-                    if rebuild_widgets or table.cellWidget(row, 12) is None:
-                        actions_widget = QWidget()
-                        actions_layout = QHBoxLayout(actions_widget)
-                        actions_layout.setContentsMargins(6, 4, 6, 4)
-                        actions_layout.setSpacing(6)
-                        actions_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-                        restart_btn = QPushButton("Restart")
-                        restart_btn.clicked.connect(lambda _, uid=uid: self.restart_user_session(uid))
-                        actions_layout.addWidget(restart_btn)
-
-                        kill_btn = QPushButton("Kill")
-                        try:
-                            kill_btn.setProperty("class", "danger")
-                        except Exception:
-                            pass
-                        kill_btn.clicked.connect(lambda _, uid=uid: self.kill_user_processes(uid))
-                        actions_layout.addWidget(kill_btn)
-
-                        table.setCellWidget(row, 12, actions_widget)
-                except Exception:
-                    pass
+                if rebuild_actions or table.item(row, 12) is None:
+                    self._set_table_actions(
+                        table,
+                        row,
+                        12,
+                        uid,
+                        (
+                            ("restart", "Restart", ModernStyle.PRIMARY),
+                            ("kill", "Kill", ModernStyle.ERROR),
+                        ),
+                        tooltip="Restart or kill this user's Roblox session",
+                    )
 
         finally:
+            if updates_suspended:
+                try:
+                    table.setUpdatesEnabled(True)
+                except Exception:
+                    pass
             try:
-                table.setUpdatesEnabled(True)
+                self._schedule_visible_table_action_widgets()
+            except Exception:
+                pass
+            try:
+                self._users_table_dirty_uids.clear()
             except Exception:
                 pass
 
@@ -30271,12 +32921,14 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
 
         now_ts = time.time()
         try:
-            table.setUpdatesEnabled(False)
-        except Exception:
-            pass
-
-        try:
-            for row in range(row_count):
+            first_row = table.rowAt(0)
+            viewport_height = table.viewport().height()
+            last_row = table.rowAt(max(0, viewport_height - 1))
+            if first_row < 0:
+                first_row = 0
+            if last_row < 0:
+                last_row = row_count - 1
+            for row in range(first_row, min(row_count, last_row + 1)):
                 try:
                     uid_item = table.item(row, 0)
                     if uid_item is None:
@@ -30305,11 +32957,9 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                             item.setText(text)
                 except Exception:
                     continue
-        finally:
-            try:
-                table.setUpdatesEnabled(True)
-            except Exception:
-                pass
+        except RuntimeError:
+            # The table can be destroyed while the window is closing.
+            return
 
     def _refresh_users_created_column(self) -> None:
         """
@@ -30324,11 +32974,6 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             row_count = int(table.rowCount())
         except Exception:
             return
-
-        try:
-            table.setUpdatesEnabled(False)
-        except Exception:
-            pass
 
         try:
             for row in range(row_count):
@@ -30359,15 +33004,20 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                     self._set_users_table_item(row, 8, created_str)
                 except Exception:
                     continue
-        finally:
-            try:
-                table.setUpdatesEnabled(True)
-            except Exception:
-                pass
+        except RuntimeError:
+            # The table can be destroyed while the window is closing.
+            return
 
     def append_log(self, message: str):
         """Compatibility wrapper so helpers can call parent.append_log()."""
         self.add_log(message)
+
+    def _feature_log_tab_is_active(self, index_attr: str) -> bool:
+        try:
+            index = getattr(self, index_attr, None)
+            return index is not None and self.tab_widget.currentIndex() == index
+        except Exception:
+            return False
 
     def _flush_log_queue(self) -> None:
         try:
@@ -30434,6 +33084,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 pass
 
     def _flush_ocr_log_queue(self) -> None:
+        if not self._feature_log_tab_is_active("ocr_tab_index"):
+            return
         q = getattr(self, "_ocr_log_queue", None)
         if not q:
             return
@@ -30485,6 +33137,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             pass
 
     def _flush_antiafk_log_queue(self) -> None:
+        if not self._feature_log_tab_is_active("antiafk_tab_index"):
+            return
         q = getattr(self, "_antiafk_log_queue", None)
         if not q:
             return
@@ -30519,6 +33173,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             pass
 
     def _flush_autoitem_log_queue(self) -> None:
+        if not self._feature_log_tab_is_active("auto_item_tab_index"):
+            return
         q = getattr(self, "_autoitem_log_queue", None)
         if not q:
             return
@@ -30553,6 +33209,8 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             pass
 
     def _flush_bes_log_queue(self) -> None:
+        if not self._feature_log_tab_is_active("bes_tab_index"):
+            return
         q = getattr(self, "_bes_log_queue", None)
         if not q:
             return
@@ -31221,9 +33879,26 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             pass
         try:
             if getattr(self, "accounts_tab_index", None) is not None and new_index == self.accounts_tab_index:
-                self.refresh_accounts_list()
+                users_mtime = float(self.config_manager.get_users_mtime())
+                if users_mtime != float(getattr(self, "_accounts_list_users_mtime", -1.0)):
+                    self.refresh_accounts_list()
         except Exception:
             pass
+        try:
+            self._schedule_visible_table_action_widgets()
+        except Exception:
+            pass
+        for index_attr, flush_name in (
+            ("ocr_tab_index", "_flush_ocr_log_queue"),
+            ("antiafk_tab_index", "_flush_antiafk_log_queue"),
+            ("auto_item_tab_index", "_flush_autoitem_log_queue"),
+            ("bes_tab_index", "_flush_bes_log_queue"),
+        ):
+            try:
+                if getattr(self, index_attr, None) == new_index:
+                    getattr(self, flush_name)()
+            except Exception:
+                pass
 
         if not self._settings_prompt_ready or prev_index is None:
             return
@@ -31277,7 +33952,11 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         self.settings_window_limit_input.setValue(settings.get("window_limit", 1))
         self.spares_mode_chk.setChecked(bool(settings.get("spares_mode", False)))
         self.spares_split_cmb.setCurrentText(settings.get("spares_fraction", "1/2"))
-        self._populate_launch_priority_table()
+        try:
+            if self.tab_widget.currentIndex() == self.settings_tab_index:
+                self._populate_launch_priority_table()
+        except Exception:
+            pass
 
         # ---------- Roblox Window Geometry ----------
         rwg = settings.get("roblox_window_geometry", {}) or {}
@@ -32166,7 +34845,7 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
     def show_about(self):
         config_info = self.config_manager.get_config_info()
         QMessageBox.about(self, "About J.JARAM",
-                         "J.JARAM (Jirach1's Just Another Roblox Account Manager) JX 2x81\n\n"
+                         "J.JARAM (Jirach1's Just Another Roblox Account Manager) JX 2x86\n\n"
                          "Advanced multi-account Roblox session manager\n"
                          "with automated log based monitoring and process management.\n\n"
                          "Built with PySide6 and modern design principles.\n\n"
@@ -32674,71 +35353,110 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
             QMessageBox.critical(self, "Error", "Failed to save account!")
 
     def refresh_accounts_list(self):
-        users_config = self.config_manager.load_users()
-        self.accounts_list.setRowCount(len(users_config))
-        for row, (user_id, user_info) in enumerate(users_config.items()):
-            if isinstance(user_info, dict):
-                username = user_info.get("username", f"User_{user_id}")
-                server_type = self._infer_account_server_type(user_info)
-                disabled = user_info.get("disabled", False)
-                bad_flag = user_info.get("bad", False)
-                cap_flag = user_info.get("cap", False)
-                is_alternate = bool(user_info.get("alternate_launch", False))
-            else:
-                username = f"User_{user_id}"
-                server_type = "private"
-                disabled = False
-                bad_flag = False
-                cap_flag = False
-                is_alternate = False
-            last_launch = user_info.get("last_launch", 0.0) if isinstance(user_info, dict) else 0.0
+        users_config = self.config_manager.peek_users()
+        table = self.accounts_list
+        order = [str(uid) for uid in users_config.keys()]
+        previous_order = list(getattr(self, "_accounts_list_order", []) or [])
+        full_rebuild = order != previous_order or table.rowCount() != len(order)
+        if full_rebuild:
+            try:
+                self._clear_virtual_table_actions(table, "_accounts_action_widget_cells")
+            except Exception:
+                pass
+        table.setUpdatesEnabled(False)
+        try:
+            if full_rebuild:
+                table.setRowCount(len(users_config))
+            new_signatures: Dict[str, tuple] = {}
+            for row, (user_id, user_info) in enumerate(users_config.items()):
+                uid = str(user_id)
+                if isinstance(user_info, dict):
+                    username = user_info.get("username", f"User_{uid}")
+                    server_type = self._infer_account_server_type(user_info)
+                    disabled = user_info.get("disabled", False)
+                    bad_flag = user_info.get("bad", False)
+                    cap_flag = user_info.get("cap", False)
+                    is_alternate = bool(user_info.get("alternate_launch", False))
+                else:
+                    username = f"User_{uid}"
+                    server_type = "private"
+                    disabled = False
+                    bad_flag = False
+                    cap_flag = False
+                    is_alternate = False
+                last_launch = user_info.get("last_launch", 0.0) if isinstance(user_info, dict) else 0.0
+                signature = (
+                    str(username),
+                    str(server_type),
+                    bool(disabled),
+                    bool(bad_flag),
+                    bool(cap_flag),
+                    bool(is_alternate),
+                    _coerce_activity_timestamp(last_launch),
+                )
+                new_signatures[uid] = signature
+                if not full_rebuild and self._accounts_list_row_signatures.get(uid) == signature:
+                    continue
 
-            self.accounts_list.setItem(row, 0, QTableWidgetItem(user_id))
-            username_item = QTableWidgetItem(username)
-            if is_alternate:
-                username_item.setForeground(QColor("#f1c40f"))
-            self.accounts_list.setItem(row, 1, username_item)
-            self.accounts_list.setItem(row, 2, QTableWidgetItem(server_type.title()))
+                table.setItem(row, 0, QTableWidgetItem(uid))
+                username_item = QTableWidgetItem(str(username))
+                if is_alternate:
+                    username_item.setForeground(QColor("#f1c40f"))
+                table.setItem(row, 1, username_item)
+                table.setItem(row, 2, QTableWidgetItem(server_type.title()))
 
-            status_text = "Disabled" if disabled else "Enabled"
-            flags = []
-            if bad_flag:
-                flags.append("bad")
-            if cap_flag:
-                flags.append("CAP")
-            if flags:
-                status_text = f"{status_text} ({'/'.join(flags)})"
-            status_item = QTableWidgetItem(status_text)
-            if disabled:
-                status_item.setForeground(QColor("#FF6666"))
-            elif bad_flag or cap_flag:
-                status_item.setForeground(QColor(ModernStyle.ERROR))
-            else:
-                status_item.setForeground(QColor("#66FF66"))
-            status_item.setData(_ACTIVITY_TIMESTAMP_ROLE, _coerce_activity_timestamp(last_launch))
-            status_item.setToolTip(f"{status_text}\n\n{_activity_tooltip(last_launch)}")
-            self.accounts_list.setItem(row, 3, status_item)
+                status_text = "Disabled" if disabled else "Enabled"
+                flags = []
+                if bad_flag:
+                    flags.append("bad")
+                if cap_flag:
+                    flags.append("CAP")
+                if flags:
+                    status_text = f"{status_text} ({'/'.join(flags)})"
+                status_item = QTableWidgetItem(status_text)
+                if disabled:
+                    status_item.setForeground(QColor("#FF6666"))
+                elif bad_flag or cap_flag:
+                    status_item.setForeground(QColor(ModernStyle.ERROR))
+                else:
+                    status_item.setForeground(QColor("#66FF66"))
+                status_item.setData(_ACTIVITY_TIMESTAMP_ROLE, _coerce_activity_timestamp(last_launch))
+                status_item.setToolTip(f"{status_text}\n\n{_activity_tooltip(last_launch)}")
+                table.setItem(row, 3, status_item)
 
-            edit_btn = QPushButton("Edit")
-            edit_btn.setStyleSheet(
-                "QPushButton {background-color:%s; color:white; border:none; padding:2px 4px; border-radius:3px; font-size:8px; font-weight:bold; min-width:50px; max-width:80px; min-height:18px; max-height:22px;} QPushButton:hover {background-color:%s;}"
-                % (ModernStyle.PRIMARY, ModernStyle.PRIMARY_VARIANT)
-            )
-            edit_btn.clicked.connect(lambda _, uid=user_id: self.edit_account(uid))
-            self.accounts_list.setCellWidget(row, 4, edit_btn)
-
-            delete_btn = QPushButton("Del")
-            delete_btn.setStyleSheet(
-                "QPushButton {background-color:#f44336; color:white; border:none; padding:2px 4px; border-radius:3px; font-size:8px; font-weight:bold; min-width:40px; max-width:70px; min-height:18px; max-height:22px;} QPushButton:hover {background-color:#da190b;}"
-            )
-            delete_btn.clicked.connect(lambda _, uid=user_id: self.delete_account(uid))
-            self.accounts_list.setCellWidget(row, 5, delete_btn)
+                self._set_table_actions(
+                    table,
+                    row,
+                    4,
+                    uid,
+                    (("edit", "Edit", ModernStyle.PRIMARY),),
+                    tooltip=f"Edit {username}",
+                )
+                self._set_table_actions(
+                    table,
+                    row,
+                    5,
+                    uid,
+                    (("delete", "Del", ModernStyle.ERROR),),
+                    tooltip=f"Delete {username}",
+                )
+            self._accounts_list_order = order
+            self._accounts_list_row_signatures = new_signatures
+        finally:
+            table.setUpdatesEnabled(True)
+        try:
+            self._schedule_visible_table_action_widgets()
+        except Exception:
+            pass
         try:
             self._accounts_list_users_mtime = float(self.config_manager.get_users_mtime())
         except Exception:
             self._accounts_list_users_mtime = 0.0
         try:
-            self._refresh_discord_control_accounts_table()
+            catalog_signature = self.config_manager.get_users_catalog_signature()
+            if catalog_signature != self._accounts_list_catalog_signature:
+                self._accounts_list_catalog_signature = catalog_signature
+                self._refresh_discord_control_accounts_table()
         except Exception:
             pass
 
@@ -33325,6 +36043,13 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
         except Exception:
             pass
 
+        try:
+            merchant_timer = getattr(self, "_merchant_fix_refresh_timer", None)
+            if merchant_timer is not None:
+                merchant_timer.stop()
+        except Exception:
+            pass
+
         if self.ocr_worker and self.ocr_worker.isRunning():
             ok = self._stop_ocr_worker_with_timeout(timeout_ms=ocr_timeout_ms) and ok
 
@@ -33383,6 +36108,46 @@ class RobloxManagerGUI(QMainWindow, FoundStatsMixin):
                 self.discord_control_service.stop(timeout=discord_timeout_s)
             except Exception:
                 pass
+        if ok:
+            try:
+                pause_state = getattr(self, "_paused_worker_state", None)
+                preserve_smart = bool(
+                    closing
+                    and getattr(self, "_manager_paused", False)
+                    and isinstance(pause_state, dict)
+                    and self._resume_state_has_live_processes(pause_state)
+                    and self.merchant_fix_controller.smart_enabled
+                )
+                detached = False
+                if preserve_smart:
+                    detached = bool(
+                        self.merchant_fix_controller.detach_for_manager_resume(
+                            pause_state
+                        )
+                    )
+                if detached:
+                    if self.merchant_fix_controller.handoff_adopted_by_replacement:
+                        self._clear_persisted_paused_manager_state()
+                        self.add_log(
+                            "[Merchant Fix] Smart PID blocks transferred to the already-resumed "
+                            "replacement manager."
+                        )
+                    else:
+                        if not self._persist_paused_manager_state():
+                            raise RuntimeError(
+                                "The paused manager state could not be saved after detaching "
+                                "the Smart helper."
+                            )
+                        self.add_log(
+                            "[Merchant Fix] Smart PID blocks remain active for the next manager."
+                        )
+                else:
+                    self.merchant_fix_controller.shutdown()
+            except Exception as exc:
+                ok = False
+                self.add_log(
+                    f"[Merchant Fix] Close cancelled because the Smart block handoff failed: {exc}"
+                )
         try:
             self._unregister_auto_item_hotkey()
         except Exception:
@@ -33850,7 +36615,7 @@ def main():
     app = QApplication(sys.argv)
 
     app.setApplicationName("J.JARAM")
-    app.setApplicationVersion("JX 2x81")
+    app.setApplicationVersion("JX 2x86")
     app.setOrganizationName("Jirach1")
     # Qt 6 ships a Windows 11 style that can change widget visuals. Force the
     # Windows 10-era style for consistent UI across OS versions.

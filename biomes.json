@@ -93,6 +93,11 @@
         "thumbnail_url": "https://raw.githubusercontent.com/Jirach-1/J.JARAM/refs/heads/main/Icons/Aurora%20Biome.png",
         "Timer": "600"
     },
+    "Incinerator": {
+        "color": "0XFFB633",
+        "thumbnail_url": "https://raw.githubusercontent.com/Jirach-1/J.JARAM/refs/heads/main/Icons/Incinerator%20Biome.png  ",
+        "Timer": "600"
+    },
     "Eggland": {
         "color": "0Xf5f5dc",
         "thumbnail_url": "https://raw.githubusercontent.com/Jirach-1/J.JARAM/refs/heads/main/Icons/Eggland%20Biome.png",

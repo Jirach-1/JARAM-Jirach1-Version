@@ -38,7 +38,7 @@ except Exception:
         return int(0x3BA55D), ""     # default color, empty thumbnail
     def biome_names() -> list[str]:
         return ["NORMAL"]
-APP_FOOTER = "J.JARAM JX 2x81"
+APP_FOOTER = "J.JARAM JX 2x86"
 HARD_EVERYONE_BIOMES = {"GLITCHED", "DREAMSPACE", "CYBERSPACE"}
 _LOOKUP_SAVE_LOCK = threading.Lock()
 # ------------------------------------------------------------------------------
@@ -1311,12 +1311,22 @@ class MultiScopeEngine:
 
     # -- User mapping / logs ---------------------------------------------------
 
-    def update_users(self, user_ids: List[str]) -> None:
-        # Advance discovery once for the whole account set.  Resolving each
-        # username used to run another bounded scan, so a cold resume with many
-        # users could spend over a minute here before processing queued state.
-        self._log_index.poll(force=True)
+    def update_users(
+        self,
+        user_ids: List[str],
+        refresh_user_ids: Optional[Set[str]] = None,
+    ) -> None:
         user_ids_set = {str(uid) for uid in (user_ids or [])}
+        previous_uids = set(self._tracked_uids)
+        added_uids = user_ids_set - previous_uids
+        refresh_uids = {
+            str(uid) for uid in (refresh_user_ids or set()) if str(uid) in user_ids_set
+        }
+        resolve_uids = added_uids | refresh_uids
+        # Discovery and username resolution are expensive. Existing users keep
+        # their cursor; only new/renamed users need to be resolved again.
+        if resolve_uids:
+            self._log_index.poll(force=True)
         self._tracked_uids = set(user_ids_set)
         with self._lock:
             # remove stale only
@@ -1353,7 +1363,7 @@ class MultiScopeEngine:
                 self._log_resolution_suspended_uids.discard(uid)
 
         # Do resolves + watcher setup without holding the engine lock
-        for uid in user_ids_set:
+        for uid in resolve_uids:
             self._resolve_current_log(uid, force=True, refresh_index=False)
             cur = self._cur.get(uid)
             if cur and cur.path:
@@ -1630,6 +1640,7 @@ class MultiScopeEngine:
         uid_s = str(uid or "").strip()
         if not uid_s:
             return False
+        self._tracked_uids.add(uid_s)
 
         # Recovery can run over RPC before the next status tick arrives. Seed
         # the new PID time immediately so its warmstart cannot act on a

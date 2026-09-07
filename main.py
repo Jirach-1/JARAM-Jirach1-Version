@@ -19,6 +19,7 @@ from cap_watchdog import (
     increment_cap_counter,
     normalize_cap_watchdog_settings,
 )
+from merchant_fix import get_merchant_fix_controller
 
 try:
     from roblox_cookie_utils import (
@@ -178,6 +179,13 @@ except ImportError:
                     "poll_interval": 10,
                 },
                 "cap_watchdog": dict(DEFAULT_CAP_WATCHDOG_SETTINGS),
+                "merchant_fix": {
+                    "smart_enabled": False,
+                    "smart_block_trigger": "boss_raid_ui",
+                    "post_marker_delay_seconds": 0.0,
+                    "smart_user_scope": "blacklist",
+                    "smart_user_ids": [],
+                },
             }
             self._ensure_directories()
 
@@ -1285,7 +1293,8 @@ class GameLauncher:
         _add(prefer_cookie)
 
         try:
-            users = self.cfg.load_users() or {}
+            peek = getattr(self.cfg, "peek_users", None)
+            users = (peek() if callable(peek) else self.cfg.load_users()) or {}
         except Exception:
             users = {}
 
@@ -1622,6 +1631,8 @@ class GameLauncher:
                 return False
             self._launch_inflight.add(uid_key)
 
+        merchant_prelaunch_applied = False
+        merchant_controller = get_merchant_fix_controller()
         try:
             with GameLauncher._global_launch_attempt_lock:
                 if not skip_cleanup:
@@ -1629,6 +1640,9 @@ class GameLauncher:
                         if pid != self.process_manager.excluded_pid:
                             self.process_manager.terminate_process(pid, self.tracker)
 
+                merchant_prelaunch_applied = bool(
+                    merchant_controller.before_roblox_launch(user_id)
+                )
                 pid_launch_ts = time.time()
                 self.log(f"[LAUNCH] uid={user_id} label={server_label} calling os.startfile()")
                 os.startfile(game_url)
@@ -1642,6 +1656,19 @@ class GameLauncher:
                         pass
 
                 new_pid = self.process_manager.await_new_process(user_id, pid_launch_ts, self.process_timeout, self.tracker)
+                if new_pid and merchant_prelaunch_applied:
+                    try:
+                        process_created_at = float(psutil.Process(int(new_pid)).create_time())
+                        merchant_controller.on_roblox_process_created(
+                            int(new_pid), user_id, process_created_at
+                        )
+                        merchant_prelaunch_applied = False
+                    except Exception:
+                        try:
+                            self.process_manager.terminate_process(int(new_pid), self.tracker)
+                        except Exception:
+                            pass
+                        raise
             if new_pid:
                 # clear bad flag if we just launched fine
                 if user_info and user_info.get("bad", False):
@@ -1697,6 +1724,8 @@ class GameLauncher:
                 pass
             return False
         finally:
+            if merchant_prelaunch_applied:
+                merchant_controller.cancel_prelaunch(user_id, "launch did not produce a usable Roblox process")
             with self._launch_inflight_lock:
                 self._launch_inflight.discard(uid_key)
             with GameLauncher._global_launch_inflight_lock:
@@ -1744,7 +1773,8 @@ class GameLauncher:
               is considered the owner.
         """
         try:
-            users = self.cfg.load_users() or {}
+            peek = getattr(self.cfg, "peek_users", None)
+            users = (peek() if callable(peek) else self.cfg.load_users()) or {}
         except Exception:
             users = {}
 

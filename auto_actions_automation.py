@@ -909,6 +909,13 @@ class RelRect:
 
 
 @dataclass(frozen=True)
+class ColorConditionCheck:
+    point: RelPoint
+    color_hex: str = "#FFFFFF"
+    tolerance: int = 0
+
+
+@dataclass(frozen=True)
 class ActionCondition:
     enabled: bool = False
     kind: str = "color"
@@ -921,6 +928,7 @@ class ActionCondition:
     case_sensitive: bool = False
     filter_ids: Tuple[str, ...] = ()
     color_filters: Tuple[Tuple[int, int, int, int], ...] = ()
+    color_checks: Tuple[ColorConditionCheck, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1099,6 +1107,42 @@ def _normalize_rel_rect(raw: Any) -> Optional[RelRect]:
     return rect
 
 
+def _normalize_condition_color_checks(
+    raw: Any,
+    *,
+    default_tolerance: int = 0,
+) -> Tuple[ColorConditionCheck, ...]:
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    out: List[ColorConditionCheck] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        point = _normalize_rel_point(item.get("point") or item.get("condition_point"))
+        if point is None and "x" in item and "y" in item:
+            point = _normalize_rel_point(item)
+        if point is None:
+            continue
+        try:
+            tolerance = max(
+                0,
+                min(
+                    255,
+                    int(item.get("tolerance", item.get("tol", default_tolerance)) or 0),
+                ),
+            )
+        except Exception:
+            tolerance = 0
+        out.append(
+            ColorConditionCheck(
+                point=point,
+                color_hex=str(item.get("color") or item.get("color_hex") or "#FFFFFF").strip() or "#FFFFFF",
+                tolerance=tolerance,
+            )
+        )
+    return tuple(out)
+
+
 def _normalize_condition(
     raw: Any,
     *,
@@ -1129,6 +1173,20 @@ def _normalize_condition(
     if point is None:
         point = legacy_point
 
+    color_hex = str(base.get("color") or base.get("color_hex") or legacy_color or "#FFFFFF").strip() or "#FFFFFF"
+    color_check_keys = ("color_checks", "color_pairs", "point_color_pairs")
+    explicit_color_checks = next((base.get(key) for key in color_check_keys if key in base), None)
+    has_explicit_color_checks = any(key in base for key in color_check_keys)
+    color_checks = (
+        _normalize_condition_color_checks(explicit_color_checks, default_tolerance=tolerance)
+        if has_explicit_color_checks
+        else ()
+    )
+    if not has_explicit_color_checks and point is not None:
+        color_checks = (
+            ColorConditionCheck(point=point, color_hex=color_hex, tolerance=tolerance),
+        )
+
     roi = _normalize_rel_rect(base.get("roi") or base.get("area") or base.get("ocr_roi"))
 
     match_mode = str(base.get("match_mode") or base.get("ocr_match_mode") or "contains").strip().lower()
@@ -1140,8 +1198,9 @@ def _normalize_condition(
         kind=kind,
         point=point,
         roi=roi,
-        color_hex=str(base.get("color") or base.get("color_hex") or legacy_color or "#FFFFFF").strip() or "#FFFFFF",
+        color_hex=color_hex,
         tolerance=tolerance,
+        color_checks=color_checks,
         target_text=str(base.get("target_text") or base.get("ocr_text") or base.get("text") or "").strip(),
         match_mode=match_mode,
         case_sensitive=bool(base.get("case_sensitive", False)),
@@ -1289,6 +1348,8 @@ def _normalize_action_step(raw: Any, *, fallback_name: str = "") -> Optional[Act
             "condition_type",
             "condition_point",
             "conditional_point",
+            "condition_color_checks",
+            "color_checks",
             "ocr_text",
             "target_text",
             "ocr_roi",
@@ -1305,6 +1366,8 @@ def _normalize_action_step(raw: Any, *, fallback_name: str = "") -> Optional[Act
                 "match_mode": raw.get("match_mode", raw.get("ocr_match_mode", "contains")),
                 "case_sensitive": raw.get("case_sensitive", False),
             }
+            if "condition_color_checks" in raw or "color_checks" in raw:
+                condition_raw["color_checks"] = raw.get("condition_color_checks", raw.get("color_checks"))
         condition = _normalize_condition(condition_raw, default_enabled=(kind == "if"))
 
     return ActionStep(
@@ -1482,6 +1545,53 @@ _AUTOIT_KEY_ALIASES = {
     "ctrl": "{CTRL}",
     "control": "{CTRL}",
     "alt": "{ALT}",
+    "caps lock": "{CAPSLOCK}",
+    "capslock": "{CAPSLOCK}",
+    "num lock": "{NUMLOCK}",
+    "numlock": "{NUMLOCK}",
+    "scroll lock": "{SCROLLLOCK}",
+    "scrolllock": "{SCROLLLOCK}",
+    "print screen": "{PRINTSCREEN}",
+    "printscreen": "{PRINTSCREEN}",
+    "pause": "{PAUSE}",
+    "break": "{BREAK}",
+    "menu": "{APPSKEY}",
+    "apps key": "{APPSKEY}",
+    "left windows": "{LWIN}",
+    "right windows": "{RWIN}",
+    "left shift": "{LSHIFT}",
+    "right shift": "{RSHIFT}",
+    "left ctrl": "{LCTRL}",
+    "right ctrl": "{RCTRL}",
+    "left alt": "{LALT}",
+    "right alt": "{RALT}",
+    "numpad 0": "{NUMPAD0}",
+    "numpad 1": "{NUMPAD1}",
+    "numpad 2": "{NUMPAD2}",
+    "numpad 3": "{NUMPAD3}",
+    "numpad 4": "{NUMPAD4}",
+    "numpad 5": "{NUMPAD5}",
+    "numpad 6": "{NUMPAD6}",
+    "numpad 7": "{NUMPAD7}",
+    "numpad 8": "{NUMPAD8}",
+    "numpad 9": "{NUMPAD9}",
+    "numpad multiply": "{NUMPADMULT}",
+    "numpad add": "{NUMPADADD}",
+    "numpad subtract": "{NUMPADSUB}",
+    "numpad divide": "{NUMPADDIV}",
+    "numpad period": "{NUMPADDOT}",
+    "numpad enter": "{NUMPADENTER}",
+    "backtick (`)": "`",
+    "minus (-)": "-",
+    "equals (=)": "=",
+    "left bracket ([)": "[",
+    "right bracket (])": "]",
+    "backslash (\\)": "\\",
+    "semicolon (;)": ";",
+    "apostrophe (')": "'",
+    "comma (,)": ",",
+    "period (.)": ".",
+    "slash (/)": "/",
 }
 
 
@@ -1696,6 +1806,14 @@ def _condition_payload(condition: ActionCondition) -> Dict[str, Any]:
         "type": str(condition.kind or "color"),
         "color": str(condition.color_hex or "#FFFFFF"),
         "tolerance": int(condition.tolerance or 0),
+        "color_checks": [
+            {
+                "point": {"x": float(check.point.x), "y": float(check.point.y)},
+                "color": str(check.color_hex or "#FFFFFF"),
+                "tolerance": int(check.tolerance or 0),
+            }
+            for check in (condition.color_checks or ())
+        ],
         "target_text": str(condition.target_text or ""),
         "match_mode": str(condition.match_mode or "contains"),
         "case_sensitive": bool(condition.case_sensitive),
@@ -1892,6 +2010,13 @@ class AutoActionEngine:
         cfg = self._cfg_snapshot()
         now = time.time()
         users = self._users_from_cfg(cfg)
+        # Parsing actions is comparatively expensive. Parse each configured row
+        # once, then apply its user filter below instead of rebuilding every
+        # ActionRule for every account in the monitor.
+        all_rules = self._rules_from_cfg(cfg)
+        raw_items = cfg.get("items") or []
+        if not isinstance(raw_items, list):
+            raw_items = []
 
         with self._state_lock:
             next_ready = copy.deepcopy(self._next_ready)
@@ -1907,6 +2032,15 @@ class AutoActionEngine:
 
         rows: List[Dict[str, Any]] = []
         for uid in users:
+            applicable_rules = []
+            for idx, rule in all_rules:
+                raw_item = raw_items[idx] if 0 <= int(idx) < len(raw_items) else {}
+                if self._item_applies_to_uid(raw_item, uid):
+                    applicable_rules.append((idx, rule))
+            if not applicable_rules:
+                continue
+
+            username = self._username(uid)
             try:
                 pid = int(self._pid_provider(uid) or 0)
             except Exception:
@@ -1920,7 +2054,7 @@ class AutoActionEngine:
             except Exception:
                 in_menu = None
 
-            for idx, rule in self._rules_from_cfg(cfg, uid=uid):
+            for idx, rule in applicable_rules:
                 idx_i = int(idx)
                 ready_at = float((next_ready.get(uid) or {}).get(idx_i, 0.0) or 0.0)
                 use_at = float((pending_use.get(uid) or {}).get(idx_i, 0.0) or 0.0)
@@ -2031,7 +2165,7 @@ class AutoActionEngine:
                 rows.append(
                     {
                         "uid": uid,
-                        "username": self._username(uid),
+                        "username": username,
                         "action_index": idx_i,
                         "action_row_id": str(rule.row_id),
                         "action_name": str(rule.name),
@@ -2252,6 +2386,11 @@ class AutoActionEngine:
         with self._cfg_lock:
             return copy.deepcopy(self._cfg or {})
 
+    def _enabled_snapshot(self) -> bool:
+        """Read the stop switch without copying the complete action document."""
+        with self._cfg_lock:
+            return bool((self._cfg or {}).get("enabled", False))
+
     def _users_from_cfg(self, cfg: Dict[str, Any]) -> List[str]:
         selected: List[str] = []
         selected_set: set[str] = set()
@@ -2318,6 +2457,68 @@ class AutoActionEngine:
         except Exception:
             return ""
 
+    @staticmethod
+    def _item_applies_to_uid(raw: object, uid: str) -> bool:
+        if not isinstance(raw, dict):
+            return False
+        uid_s = str(uid).strip()
+        selected_users = _normalize_user_id_list(raw.get("users", None))
+        if not isinstance(selected_users, list):
+            return True
+
+        user_filter_mode = _normalize_user_filter_mode(raw.get("user_filter_mode", "whitelist"))
+        if user_filter_mode == "blacklist":
+            return not selected_users or uid_s not in selected_users
+        if selected_users:
+            return uid_s in selected_users
+        return not bool(raw.get("users_explicit", False))
+
+    @staticmethod
+    def _compile_item_user_filters(cfg: Dict[str, Any]) -> Dict[int, Tuple[Optional[frozenset[str]], str, bool]]:
+        compiled: Dict[int, Tuple[Optional[frozenset[str]], str, bool]] = {}
+        raw_items = cfg.get("items") or []
+        if not isinstance(raw_items, list):
+            return compiled
+        for idx, raw in enumerate(raw_items):
+            if not isinstance(raw, dict):
+                continue
+            selected = _normalize_user_id_list(raw.get("users", None))
+            compiled[idx] = (
+                None if selected is None else frozenset(str(uid) for uid in selected),
+                _normalize_user_filter_mode(raw.get("user_filter_mode", "whitelist")),
+                bool(raw.get("users_explicit", False)),
+            )
+        return compiled
+
+    @staticmethod
+    def _compiled_item_applies_to_uid(
+        spec: Optional[Tuple[Optional[frozenset[str]], str, bool]],
+        uid: str,
+    ) -> bool:
+        if spec is None:
+            return False
+        selected, mode, users_explicit = spec
+        if selected is None:
+            return True
+        uid_s = str(uid).strip()
+        if mode == "blacklist":
+            return not selected or uid_s not in selected
+        if selected:
+            return uid_s in selected
+        return not users_explicit
+
+    def _parsed_rules_for_uid(
+        self,
+        rules: Sequence[Tuple[int, ActionRule]],
+        user_filters: Dict[int, Tuple[Optional[frozenset[str]], str, bool]],
+        uid: str,
+    ) -> List[Tuple[int, ActionRule]]:
+        return [
+            (idx, rule)
+            for idx, rule in rules
+            if self._compiled_item_applies_to_uid(user_filters.get(int(idx)), uid)
+        ]
+
     def _rules_from_cfg(self, cfg: Dict[str, Any], *, uid: Optional[str] = None) -> List[Tuple[int, ActionRule]]:
         out: List[Tuple[int, ActionRule]] = []
         raw_items = cfg.get("items") or []
@@ -2330,21 +2531,8 @@ class AutoActionEngine:
             if not isinstance(raw, dict):
                 continue
 
-            if uid_s is not None:
-                raw_users = raw.get("users", None)
-                users_explicit = bool(raw.get("users_explicit", False))
-                selected_users = _normalize_user_id_list(raw_users)
-                user_filter_mode = _normalize_user_filter_mode(raw.get("user_filter_mode", "whitelist"))
-                if isinstance(selected_users, list):
-                    if user_filter_mode == "blacklist":
-                        if selected_users and uid_s in selected_users:
-                            continue
-                    else:
-                        if selected_users:
-                            if uid_s not in selected_users:
-                                continue
-                        elif users_explicit:
-                            continue
+            if uid_s is not None and not self._item_applies_to_uid(raw, uid_s):
+                continue
 
             actions_raw = raw.get("actions") or []
             if not isinstance(actions_raw, list):
@@ -2701,29 +2889,41 @@ class AutoActionEngine:
                 return False
             return _ocr_text_matches(text, condition)
 
-        if condition.point is None:
-            time.sleep(max(0.01, float(click_delay)))
-            return False
-
-        abs_xy = _abs_from_rel(hwnd, condition.point)
-        if not abs_xy:
-            time.sleep(max(0.01, float(click_delay)))
-            return False
-
-        expected = _hex_to_rgb(condition.color_hex)
-        tolerance = int(condition.tolerance or 0)
-        sampled = [
-            px
-            for px in (
-                _window_rel_pixel_rgb(hwnd, condition.point),
-                _screen_pixel_rgb(*abs_xy),
+        color_checks = tuple(condition.color_checks or ())
+        if not color_checks and condition.point is not None:
+            color_checks = (
+                ColorConditionCheck(
+                    point=condition.point,
+                    color_hex=condition.color_hex,
+                    tolerance=condition.tolerance,
+                ),
             )
-            if px is not None
-        ]
-        if not sampled:
+        if not color_checks:
             time.sleep(max(0.01, float(click_delay)))
             return False
-        return any(_color_close(px, expected, tolerance) for px in sampled)
+
+        for check in color_checks:
+            abs_xy = _abs_from_rel(hwnd, check.point)
+            if not abs_xy:
+                time.sleep(max(0.01, float(click_delay)))
+                return False
+
+            expected = _hex_to_rgb(check.color_hex)
+            tolerance = int(check.tolerance or 0)
+            sampled = [
+                px
+                for px in (
+                    _window_rel_pixel_rgb(hwnd, check.point),
+                    _screen_pixel_rgb(*abs_xy),
+                )
+                if px is not None
+            ]
+            if not sampled:
+                time.sleep(max(0.01, float(click_delay)))
+                return False
+            if not any(_color_close(px, expected, tolerance) for px in sampled):
+                return False
+        return True
 
     @staticmethod
     def _find_if_bounds(actions: Sequence[ActionStep], start_idx: int, end_idx: Optional[int] = None) -> Tuple[Optional[int], int]:
@@ -3456,7 +3656,15 @@ class AutoActionEngine:
             if not seq_map:
                 self._pending_trigger_seq.pop(uid_s, None)
 
-    def _dispatch_next_due_alert(self, cfg: Dict[str, Any], users: Sequence[str], *, click_delay: float) -> bool:
+    def _dispatch_next_due_alert(
+        self,
+        cfg: Dict[str, Any],
+        users: Sequence[str],
+        *,
+        click_delay: float,
+        parsed_rules: Optional[Sequence[Tuple[int, ActionRule]]] = None,
+        user_filters: Optional[Dict[int, Tuple[Optional[frozenset[str]], str, bool]]] = None,
+    ) -> bool:
         now = time.time()
         try:
             if now < float(self._last_alert_send_at or 0.0) + 1.0:
@@ -3466,11 +3674,19 @@ class AutoActionEngine:
 
         user_order = {str(uid): pos for pos, uid in enumerate(users or [])}
         candidates: List[Tuple[float, float, int, str, int, ActionRule]] = []
+        all_rules = list(parsed_rules) if parsed_rules is not None else self._rules_from_cfg(cfg)
+        filters = user_filters if user_filters is not None else self._compile_item_user_filters(cfg)
 
         with self._state_lock:
-            for uid in users or []:
+            # Usually this is empty. Do not parse/filter rules for hundreds of
+            # accounts when no pre-sequence alert is waiting.
+            pending_uids = [uid for uid in self._pending_alert_send_at if str(uid) in user_order]
+            for uid in pending_uids:
                 uid_s = str(uid)
-                rules_by_idx = {int(idx): rule for idx, rule in self._rules_from_cfg(cfg, uid=uid_s)}
+                rules_by_idx = {
+                    int(idx): rule
+                    for idx, rule in self._parsed_rules_for_uid(all_rules, filters, uid_s)
+                }
                 pending = self._pending_use_at.get(uid_s) or {}
                 send_map = self._pending_alert_send_at.get(uid_s) or {}
                 for raw_idx, raw_send_at in list(send_map.items()):
@@ -3837,6 +4053,11 @@ class AutoActionEngine:
                 self._stop.wait(timeout=max(0.5, interval))
                 continue
 
+            # Normalize action steps and per-rule user filters once per engine
+            # cycle, then reuse them for every live account.
+            all_rules = self._rules_from_cfg(cfg)
+            user_filters = self._compile_item_user_filters(cfg)
+
             try:
                 active_users = {str(uid) for uid in users}
             except Exception:
@@ -3850,7 +4071,13 @@ class AutoActionEngine:
                             self._pending_trigger_seq.pop(str(pending_uid), None)
 
             try:
-                self._dispatch_next_due_alert(cfg, users, click_delay=click_delay)
+                self._dispatch_next_due_alert(
+                    cfg,
+                    users,
+                    click_delay=click_delay,
+                    parsed_rules=all_rules,
+                    user_filters=user_filters,
+                )
             except Exception as e:
                 try:
                     self._log(f"[Auto-Actions] alert dispatch error: {e}")
@@ -3867,7 +4094,7 @@ class AutoActionEngine:
                         break
 
                     try:
-                        if not bool(self._cfg_snapshot().get("enabled", False)):
+                        if not self._enabled_snapshot():
                             break
                     except Exception:
                         pass
@@ -3899,7 +4126,7 @@ class AutoActionEngine:
                         self._cancel_overdue_pending_alerts(uid, now=now_ts, reason="menu gate")
                         continue
 
-                    rules = self._rules_from_cfg(cfg, uid=uid)
+                    rules = self._parsed_rules_for_uid(all_rules, user_filters, uid)
                     if not rules:
                         with self._state_lock:
                             self._pending_use_at.pop(str(uid), None)
@@ -4028,7 +4255,13 @@ class AutoActionEngine:
                         pass
 
             try:
-                self._dispatch_next_due_alert(cfg, users, click_delay=click_delay)
+                self._dispatch_next_due_alert(
+                    cfg,
+                    users,
+                    click_delay=click_delay,
+                    parsed_rules=all_rules,
+                    user_filters=user_filters,
+                )
             except Exception as e:
                 try:
                     self._log(f"[Auto-Actions] alert dispatch error: {e}")
@@ -4036,7 +4269,7 @@ class AutoActionEngine:
                     pass
 
             try:
-                if not bool(self._cfg_snapshot().get("enabled", False)):
+                if not self._enabled_snapshot():
                     continue
             except Exception:
                 pass

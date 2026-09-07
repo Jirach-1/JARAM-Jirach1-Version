@@ -43,6 +43,30 @@ _FRAME_HASH_SIZE = 16  # 16x16 = 256-bit perceptual hash (fast, robust to minor 
 _WINDOW_ENUM_INTERVAL_SECONDS = 1.0
 _OCR_INFERENCE_SIZE = (1024, 512)
 _OCR_EMPTY_COLOR_MASK_PIXELS = 0
+_OCR_COMBINED_COLUMNS = 5
+_OCR_COMBINED_GUTTER = 8
+
+
+def _normalize_ocr_processing_mode(value: Any) -> str:
+    mode = str(value or "").strip().lower()
+    if mode in {"combined", "combined_batch", "batch", "tiled"}:
+        return "combined"
+    return "separate"
+
+
+def _chunk_combined_ocr_items(
+    entries: List[Dict[str, Any]],
+    metadata: List[Dict[str, Any]],
+    max_images: int,
+) -> List[Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]]:
+    """Split OCR inputs and their routing metadata into aligned composites."""
+    if len(entries) != len(metadata):
+        raise ValueError("Combined OCR entries and metadata must have the same length")
+    limit = max(1, int(max_images or 1))
+    return [
+        (entries[start : start + limit], metadata[start : start + limit])
+        for start in range(0, len(entries), limit)
+    ]
 
 
 def compute_frame_hash(image: Image.Image, hash_size: int = _FRAME_HASH_SIZE) -> int:
@@ -495,6 +519,9 @@ def _init_rapidocr_engine(
 
         use_dml = dml_available and not force_cpu
         rapidocr_params: Dict[str, Any] = {
+            # Empty OCR results are expected while polling frames, so keep
+            # RapidOCR's per-call INFO/WARNING output out of the terminal.
+            "Global.log_level": "critical",
             "Global.use_cls": False,
             "EngineConfig.onnxruntime.use_dml": use_dml,
             "EngineConfig.onnxruntime.use_cuda": False,
@@ -590,6 +617,99 @@ def _pool_read_text(img_payload: Tuple[str, Tuple[int, int], bytes]) -> str:
     return _rapidocr_text_only(_POOL_ENGINE, _ocr_input_array(img))
 
 
+def _tile_ocr_input_arrays(
+    images: List[np.ndarray],
+    *,
+    columns: int = _OCR_COMBINED_COLUMNS,
+    gutter: int = _OCR_COMBINED_GUTTER,
+) -> Tuple[np.ndarray, List[Tuple[int, int, int, int]]]:
+    """Tile normalized OCR inputs and return each tile's bounds."""
+    if not images:
+        raise ValueError("At least one OCR image is required")
+
+    tile_w, tile_h = _OCR_INFERENCE_SIZE
+    columns = max(1, min(int(columns or 1), len(images)))
+    rows = (len(images) + columns - 1) // columns
+    gutter = max(0, int(gutter or 0))
+    width = columns * tile_w + max(0, columns - 1) * gutter
+    height = rows * tile_h + max(0, rows - 1) * gutter
+    tiled = np.full((height, width, 3), 255, dtype=np.uint8)
+    bounds: List[Tuple[int, int, int, int]] = []
+
+    for index, image in enumerate(images):
+        row, column = divmod(index, columns)
+        x0 = column * (tile_w + gutter)
+        y0 = row * (tile_h + gutter)
+        x1 = x0 + tile_w
+        y1 = y0 + tile_h
+        array = np.asarray(image, dtype=np.uint8)
+        if array.shape != (tile_h, tile_w, 3):
+            raise ValueError(
+                f"Combined OCR input {index} has shape {array.shape}; "
+                f"expected {(tile_h, tile_w, 3)}"
+            )
+        tiled[y0:y1, x0:x1] = array
+        bounds.append((x0, y0, x1, y1))
+    return tiled, bounds
+
+
+def _rapidocr_texts_by_tile(
+    engine: Any,
+    images: List[np.ndarray],
+    *,
+    columns: int = _OCR_COMBINED_COLUMNS,
+    gutter: int = _OCR_COMBINED_GUTTER,
+) -> List[str]:
+    """Run RapidOCR once and route detected text back to its source tile."""
+    if not images:
+        return []
+    if len(images) == 1:
+        return [_rapidocr_text_only(engine, images[0])]
+
+    tiled, bounds = _tile_ocr_input_arrays(images, columns=columns, gutter=gutter)
+    with _RAPIDOCR_NATIVE_LOCK:
+        ocr_result = engine(tiled)
+
+    texts = list(getattr(ocr_result, "txts", None) or ())
+    if not texts:
+        return [""] * len(images)
+    boxes = getattr(ocr_result, "boxes", None)
+    if boxes is None or len(boxes) != len(texts):
+        raise RuntimeError("RapidOCR combined output did not include one box per text detection")
+
+    routed: List[List[str]] = [[] for _ in images]
+    for text, box in zip(texts, boxes):
+        if not text:
+            continue
+        points = np.asarray(box, dtype=np.float64).reshape(-1, 2)
+        if points.size == 0 or not np.isfinite(points).all():
+            raise RuntimeError("RapidOCR combined output included an invalid text box")
+        center_x = float(points[:, 0].mean())
+        center_y = float(points[:, 1].mean())
+
+        tile_index = None
+        for index, (x0, y0, x1, y1) in enumerate(bounds):
+            if x0 <= center_x < x1 and y0 <= center_y < y1:
+                tile_index = index
+                break
+        if tile_index is None:
+            raise RuntimeError("RapidOCR combined text box fell outside every source tile")
+        routed[tile_index].append(str(text))
+
+    return ["\n".join(lines) for lines in routed]
+
+
+def _pool_read_texts_combined(
+    img_payloads: List[Tuple[str, Tuple[int, int], bytes]],
+) -> List[str]:
+    """Read multiple images in one tiled RapidOCR detector call."""
+    global _POOL_ENGINE
+    if _POOL_ENGINE is None:
+        _init_pool_reader()
+    inputs = [_ocr_input_array(_image_from_payload(payload)) for payload in img_payloads]
+    return _rapidocr_texts_by_tile(_POOL_ENGINE, inputs)
+
+
 def _ocr_text_task(img_payload: Tuple[str, Tuple[int, int], bytes]) -> Dict[str, Any]:
     try:
         return {"text": _pool_read_text(img_payload)}
@@ -680,6 +800,80 @@ def _ocr_pool_task(
         return {"matches": matches, "text": text}
     except Exception as e:
         return {"matches": [], "error": f"{e.__class__.__name__}: {e}"}
+
+
+def _ocr_combined_pool_task(entries: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Run each entry's broad OCR read as one tiled call, then verify matches normally."""
+    if not entries:
+        return {"results": []}
+
+    try:
+        broad_payloads = [
+            entry["preprocessed_payload"]
+            if bool(entry.get("use_preprocess", True))
+            else entry["raw_payload"]
+            for entry in entries
+        ]
+        broad_texts = _pool_read_texts_combined(broad_payloads)
+        if len(broad_texts) != len(entries):
+            raise RuntimeError("Combined OCR returned an unexpected number of tile results")
+    except Exception as e:
+        fallback_results = [
+            _ocr_pool_task(
+                entry["preprocessed_payload"],
+                entry["raw_payload"],
+                list(entry.get("filters") or []),
+                bool(entry.get("use_preprocess", True)),
+            )
+            for entry in entries
+        ]
+        return {
+            "results": fallback_results,
+            "fallback_error": f"{e.__class__.__name__}: {e}",
+        }
+
+    results: List[Dict[str, Any]] = []
+    for entry, text in zip(entries, broad_texts):
+        try:
+            filters = list(entry.get("filters") or [])
+            use_preprocess = bool(entry.get("use_preprocess", True))
+            ranked = _rank_filter_candidates(text, filters)
+            if not ranked:
+                results.append({"matches": [], "text": text})
+                continue
+
+            raw_img = _image_from_payload(entry["raw_payload"]).convert("RGB")
+            matches: List[Dict[str, Any]] = []
+            for score, spec in ranked:
+                if use_preprocess:
+                    verify_prepared = _prepare_filter_ocr_image_with_stats(raw_img, [spec])
+                    if _prepared_has_empty_color_mask(verify_prepared):
+                        continue
+                    # Keep candidate verification separate to preserve the existing
+                    # full-size verification behavior and its accuracy.
+                    verify_text = _pool_read_text(_image_payload(verify_prepared.image))
+                else:
+                    verify_text = text
+                verify_score = _score_text_against_target(
+                    verify_text,
+                    str(spec.get("target_text", "") or ""),
+                )
+                if verify_score >= DEFAULT_OCR_MATCH_THRESHOLD:
+                    matches.append(
+                        {
+                            "id": str(spec.get("id") or ""),
+                            "name": str(spec.get("name") or ""),
+                            "behavior": str(spec.get("behavior") or ""),
+                            "cooldown_group": str(spec.get("cooldown_group") or ""),
+                            "score": float(score),
+                            "verify_score": float(verify_score),
+                        }
+                    )
+            results.append({"matches": matches, "text": text})
+        except Exception as e:
+            results.append({"matches": [], "error": f"{e.__class__.__name__}: {e}", "text": text})
+
+    return {"results": results}
 
 
 # -----------------------------
@@ -1799,6 +1993,7 @@ class OCRWorker(QThread):
         try:
             self.status_signal.emit("running")
             self._log("OCR worker started.")
+            self._log(f"[OCR] Processing mode: {self._processing_mode}.")
             self._start_window_enumerator()
 
             while not self._stop_event.is_set():
@@ -1857,11 +2052,21 @@ class OCRWorker(QThread):
                             f"in {_format_step_duration(verification_elapsed)}."
                         )
 
-                        remaining_slots = max(1, int(getattr(self, "_max_captures_per_second", 1) or 1))
+                        configured_batch_limit = max(
+                            1,
+                            int(getattr(self, "_max_captures_per_second", 1) or 1),
+                        )
                         processed_count = 0
                         skipped_similar = 0
                         captured_count = 0
                         future_map = {}
+                        processing_mode = _normalize_ocr_processing_mode(
+                            getattr(self, "_processing_mode", "separate")
+                        )
+                        combined_mode = processing_mode == "combined"
+                        remaining_slots = len(work_list) if combined_mode else configured_batch_limit
+                        combined_entries: List[Dict[str, Any]] = []
+                        combined_meta: List[Dict[str, Any]] = []
 
                         pending_groups: List[Dict[str, Any]] = []
                         step_started = time.perf_counter()
@@ -1883,6 +2088,7 @@ class OCRWorker(QThread):
                         dispatch_elapsed = 0.0
                         skipped_empty_mask = 0
                         dispatched_count = 0
+                        combined_batch_count = 0
 
                         for entry in pending_groups:
                             if self._stop_event.is_set() or remaining_slots <= 0:
@@ -1956,26 +2162,64 @@ class OCRWorker(QThread):
                                     prep_payload = _image_payload(prep_img)
                                     payload_elapsed += time.perf_counter() - step_started
 
-                                    step_started = time.perf_counter()
-                                    fut = self._ocr_pool.submit(
-                                        _ocr_pool_task,
-                                        prep_payload,
-                                        raw_payload,
-                                        group["filters"],
-                                        self._use_preprocess,
-                                    )
-                                    dispatch_elapsed += time.perf_counter() - step_started
-                                    dispatched_count += 1
-                                    future_map[fut] = {
+                                    task_meta = {
                                         "win": win,
                                         "raw_img": raw_img,
                                         "group": group,
                                     }
+                                    if combined_mode:
+                                        combined_entries.append(
+                                            {
+                                                "preprocessed_payload": prep_payload,
+                                                "raw_payload": raw_payload,
+                                                "filters": group["filters"],
+                                                "use_preprocess": self._use_preprocess,
+                                            }
+                                        )
+                                        combined_meta.append(task_meta)
+                                    else:
+                                        step_started = time.perf_counter()
+                                        fut = self._ocr_pool.submit(
+                                            _ocr_pool_task,
+                                            prep_payload,
+                                            raw_payload,
+                                            group["filters"],
+                                            self._use_preprocess,
+                                        )
+                                        dispatch_elapsed += time.perf_counter() - step_started
+                                        future_map[fut] = task_meta
+                                        dispatched_count += 1
                                 except Exception as e:
                                     dispatch_elapsed += time.perf_counter() - step_started
                                     self._log(f"[OCR] Failed to dispatch process task for PID {win.pid}: {e}")
                                     if isinstance(e, BrokenProcessPool):
                                         self._restart_ocr_pool()
+
+                        if combined_mode and combined_entries and self._ocr_pool:
+                            combined_batches = _chunk_combined_ocr_items(
+                                combined_entries,
+                                combined_meta,
+                                configured_batch_limit,
+                            )
+                            for batch_index, (batch_entries, batch_meta) in enumerate(
+                                combined_batches,
+                                start=1,
+                            ):
+                                step_started = time.perf_counter()
+                                try:
+                                    fut = self._ocr_pool.submit(_ocr_combined_pool_task, batch_entries)
+                                    future_map[fut] = {"batch_meta": batch_meta}
+                                    dispatched_count += len(batch_entries)
+                                    combined_batch_count += 1
+                                except Exception as e:
+                                    self._log(
+                                        f"[OCR] Failed to dispatch combined OCR batch "
+                                        f"{batch_index}/{len(combined_batches)}: {e}"
+                                    )
+                                    if isinstance(e, BrokenProcessPool):
+                                        self._restart_ocr_pool()
+                                finally:
+                                    dispatch_elapsed += time.perf_counter() - step_started
 
                         self._log(
                             f"[Loop {loop_idx}] Captured {captured_count} window image(s) "
@@ -1988,7 +2232,9 @@ class OCRWorker(QThread):
                             f"preprocess {_format_step_duration(preprocess_elapsed)}, "
                             f"frame compare {_format_step_duration(frame_compare_elapsed)}, "
                             f"empty masks {skipped_empty_mask}, "
-                            f"dispatch {dispatched_count} task(s) in {_format_step_duration(dispatch_elapsed)})."
+                            f"dispatch {dispatched_count} image task(s)"
+                            f"{f' in {combined_batch_count} combined batch(es)' if combined_mode else ''} "
+                            f"in {_format_step_duration(dispatch_elapsed)})."
                         )
 
                         pending = set(future_map.keys())
@@ -2013,44 +2259,70 @@ class OCRWorker(QThread):
                                 step_started = time.perf_counter()
                                 try:
                                     meta = future_map.get(fut) or {}
-                                    win = meta.get("win")
-                                    raw_img = meta.get("raw_img")
-                                    group = meta.get("group") or {}
-                                    if win is None or raw_img is None:
-                                        continue
                                     if self._stop_event.is_set():
                                         break
                                     try:
-                                        result = fut.result()
+                                        future_result = fut.result()
                                     except Exception as e:
-                                        self._log(f"[OCR] Worker process error for PID {win.pid}: {e}")
+                                        win = meta.get("win")
+                                        pid_label = f" for PID {win.pid}" if win is not None else ""
+                                        self._log(f"[OCR] Worker process error{pid_label}: {e}")
                                         if isinstance(e, BrokenProcessPool):
                                             self._restart_ocr_pool()
                                         continue
 
-                                    if not isinstance(result, dict):
-                                        continue
-                                    if result.get("error"):
-                                        self._log(f"[OCR] Worker reported error for PID {win.pid}: {result['error']}")
-                                        continue
-
-                                    if getattr(self, "_log_ocr_text", False):
-                                        text = str(result.get("text") or "").strip()
-                                        if text:
-                                            self._log(f"[OCR TEXT] PID {win.pid} [{group.get('label') or 'group'}]:\n{text}")
-
-                                    matches = result.get("matches")
-                                    if not isinstance(matches, list):
-                                        legacy_match = result.get("match")
-                                        matches = [legacy_match] if isinstance(legacy_match, dict) else []
-                                    for match in matches:
-                                        if not isinstance(match, dict):
+                                    batch_meta = meta.get("batch_meta")
+                                    if isinstance(batch_meta, list):
+                                        if not isinstance(future_result, dict):
                                             continue
-                                        spec = self._filter_spec_by_id(str(match.get("id") or ""))
-                                        if spec:
-                                            if self._handle_filter_match(spec, win.pid, raw_img):
-                                                self._set_filter_cooldown(win.pid, spec)
-                                    processed_count += 1
+                                        fallback_error = str(future_result.get("fallback_error") or "").strip()
+                                        if fallback_error:
+                                            self._log(
+                                                f"[OCR] Combined batch fell back to separate reads: {fallback_error}"
+                                            )
+                                        batch_results = future_result.get("results")
+                                        if not isinstance(batch_results, list):
+                                            self._log("[OCR] Combined OCR worker returned no result list.")
+                                            continue
+                                        if len(batch_results) != len(batch_meta):
+                                            self._log(
+                                                "[OCR] Combined OCR worker returned "
+                                                f"{len(batch_results)} result(s) for {len(batch_meta)} task(s)."
+                                            )
+                                        result_items = list(zip(batch_meta, batch_results))
+                                    else:
+                                        result_items = [(meta, future_result)]
+
+                                    for item_meta, result in result_items:
+                                        win = item_meta.get("win") if isinstance(item_meta, dict) else None
+                                        raw_img = item_meta.get("raw_img") if isinstance(item_meta, dict) else None
+                                        group = (item_meta.get("group") or {}) if isinstance(item_meta, dict) else {}
+                                        if win is None or raw_img is None or not isinstance(result, dict):
+                                            continue
+                                        if result.get("error"):
+                                            self._log(f"[OCR] Worker reported error for PID {win.pid}: {result['error']}")
+                                            continue
+
+                                        if getattr(self, "_log_ocr_text", False):
+                                            text = str(result.get("text") or "").strip()
+                                            if text:
+                                                self._log(
+                                                    f"[OCR TEXT] PID {win.pid} "
+                                                    f"[{group.get('label') or 'group'}]:\n{text}"
+                                                )
+
+                                        matches = result.get("matches")
+                                        if not isinstance(matches, list):
+                                            legacy_match = result.get("match")
+                                            matches = [legacy_match] if isinstance(legacy_match, dict) else []
+                                        for match in matches:
+                                            if not isinstance(match, dict):
+                                                continue
+                                            spec = self._filter_spec_by_id(str(match.get("id") or ""))
+                                            if spec:
+                                                if self._handle_filter_match(spec, win.pid, raw_img):
+                                                    self._set_filter_cooldown(win.pid, spec)
+                                        processed_count += 1
                                 finally:
                                     result_handle_elapsed += time.perf_counter() - step_started
 
@@ -2322,7 +2594,10 @@ class OCRWorker(QThread):
         if total == 0:
             return []
 
-        limit = min(self._max_captures_per_second, total)
+        if _normalize_ocr_processing_mode(getattr(self, "_processing_mode", "separate")) == "combined":
+            limit = total
+        else:
+            limit = min(self._max_captures_per_second, total)
         start_idx = self._capture_rr_index % total
         idx = start_idx
         seen = 0
@@ -2530,6 +2805,9 @@ class OCRWorker(QThread):
         self._only_mapped_pids = bool(self._ocr_cfg.get("only_mapped_pids", False))
         self._workers = max(1, int(self._ocr_cfg.get("workers", 1) or 1))
         self._max_captures_per_second = max(1, int(self._ocr_cfg.get("max_captures_per_second", 20) or 1))
+        self._processing_mode = _normalize_ocr_processing_mode(
+            self._ocr_cfg.get("processing_mode", "separate")
+        )
         try:
             self._batch_delay_seconds = max(0.0, float(self._ocr_cfg.get("batch_delay_seconds", 1.0)))
         except Exception:

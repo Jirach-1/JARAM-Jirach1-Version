@@ -234,15 +234,20 @@ def _multiscope_worker_main(cmd_q: mp.Queue, out_q: mp.Queue) -> None:
                 user_ids_set = set(user_ids)
                 incoming_usernames = cmd.get("usernames")
                 incoming_cookies = cmd.get("cookies")
+                refresh_user_ids: set[str] = set()
                 if "usernames" in cmd and isinstance(incoming_usernames, dict):
+                    normalized_usernames = {
+                        str(k): str(v or "")
+                        for k, v in incoming_usernames.items()
+                        if str(k) in user_ids_set
+                    }
+                    refresh_user_ids = {
+                        uid
+                        for uid, username in normalized_usernames.items()
+                        if uid in usernames_by_uid and usernames_by_uid.get(uid) != username
+                    }
                     usernames_by_uid.clear()
-                    usernames_by_uid.update(
-                        {
-                            str(k): str(v or "")
-                            for k, v in incoming_usernames.items()
-                            if str(k) in user_ids_set
-                        }
-                    )
+                    usernames_by_uid.update(normalized_usernames)
                 else:
                     for uid in list(usernames_by_uid.keys()):
                         if uid not in user_ids_set:
@@ -269,7 +274,7 @@ def _multiscope_worker_main(cmd_q: mp.Queue, out_q: mp.Queue) -> None:
                 for uid in list(owner_by_uid.keys()):
                     if uid not in user_ids_set:
                         owner_by_uid.pop(uid, None)
-                engine.update_users(user_ids)
+                engine.update_users(user_ids, refresh_user_ids=refresh_user_ids)
                 _publish_snapshot(force=True)
 
             elif ctype == "configure_webhooks":
